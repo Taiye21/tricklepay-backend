@@ -552,6 +552,7 @@ export const apiErrorSchema = {
       enum: [
         "VALIDATION_ERROR",
         "NOT_FOUND",
+        "RATE_LIMITED",
         "REQUEST_ERROR",
         "INTERNAL_SERVER_ERROR",
       ],
