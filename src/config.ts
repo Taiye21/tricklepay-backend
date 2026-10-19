@@ -4,7 +4,7 @@
 
 import { StrKey } from "@stellar/stellar-sdk";
 
-import { parseTrustedProxies } from "./proxy.js";
+import { parseTrustedProxies, parseAllowlist } from "./proxy.js";
 
 try {
   process.loadEnvFile();
@@ -116,7 +116,7 @@ function validateRpcUrl(url: string): void {
   if (url.startsWith("http://") && !isLocalUrl(url)) {
     throw new Error(
       `SOROBAN_RPC_URL "${url}" uses plain HTTP on a non-local host. ` +
-        `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
+      `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
     );
   }
 }
@@ -129,7 +129,7 @@ function validateContractId(contractId: string): void {
   if (!StrKey.isValidContract(contractId)) {
     throw new Error(
       `STREAM_CONTRACT_ID "${contractId}" is not a valid Soroban contract address. ` +
-        `Expected a 56-character StrKey contract id starting with "C".`,
+      `Expected a 56-character StrKey contract id starting with "C".`,
     );
   }
 }
@@ -142,7 +142,7 @@ export function validateStartLedger(startLedger: number, chainHead: number): voi
   if (startLedger > chainHead) {
     throw new Error(
       `INDEXER_START_LEDGER ${startLedger} is beyond the chain head ${chainHead}. ` +
-        `The indexer would wait forever with no events. Set INDEXER_START_LEDGER to ${chainHead} or lower.`,
+      `The indexer would wait forever with no events. Set INDEXER_START_LEDGER to ${chainHead} or lower.`,
     );
   }
 }
@@ -165,6 +165,7 @@ export interface Config {
   readonly trustedProxies: readonly string[];
   readonly rateLimitMax?: number;
   readonly rateLimitWindowMs?: number;
+  readonly rateLimitAllowlist: readonly string[];
 }
 
 export function loadConfig(): Config {
@@ -219,6 +220,8 @@ export function loadConfig(): Config {
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
     rateLimitMax,
     rateLimitWindowMs,
+    // Addresses that bypass the rate limiter entirely (#allowlist).
+    rateLimitAllowlist: parseAllowlist(process.env.RATE_LIMIT_ALLOWLIST),
   };
 }
 
@@ -295,5 +298,6 @@ export function describeConfig(config: Config): LoggedConfig {
     // Undefined when rate limiting is not configured; pino omits the field.
     rateLimitMax: config.rateLimitMax,
     rateLimitWindowMs: config.rateLimitWindowMs,
+    rateLimitAllowlist: config.rateLimitAllowlist,
   };
 }

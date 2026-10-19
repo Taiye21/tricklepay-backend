@@ -29,7 +29,7 @@ import { logger } from "./logger.js";
 
 import { registerMetricsPlugin } from "./metrics-plugin.js";
 
-import { isTrustedProxyAddress } from "./proxy.js";
+import { isTrustedProxyAddress, isAllowlistedAddress } from "./proxy.js";
 
 import { parseQueryString } from "./query-string-parser.js";
 
@@ -56,6 +56,7 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
   const trustedProxies = config?.trustedProxies ?? [];
   const rateLimitMax = config?.rateLimitMax ?? DEFAULT_RATE_LIMIT_MAX;
   const rateLimitWindowMs = config?.rateLimitWindowMs ?? DEFAULT_RATE_LIMIT_WINDOW_MS;
+  const rateLimitAllowlist = config?.rateLimitAllowlist ?? [];
   const app = Fastify({
     // Fastify types its logger as FastifyBaseLogger; the pino instance
     // satisfies that interface at runtime.
@@ -101,6 +102,12 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
 
   app.addHook("onRequest", async (request, reply) => {
     const now = Date.now();
+
+    // Allowlisted addresses are never counted or limited.
+    if (rateLimitAllowlist.length > 0 && isAllowlistedAddress(request.ip, rateLimitAllowlist)) {
+      return;
+    }
+
     let window = clientWindows.get(request.ip);
 
     if (!window || window.resetAt <= now) {
