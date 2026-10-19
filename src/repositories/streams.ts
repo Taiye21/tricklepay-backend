@@ -76,6 +76,8 @@ export interface StreamFilter {
   cursor?: bigint;
   limit?: number;
   offset?: number;
+  minAmount?: bigint;
+  maxAmount?: bigint;
 }
 
 export interface StreamListResult {
@@ -271,6 +273,14 @@ function whereFromFilter(filter: StreamFilter): Prisma.StreamWhereInput {
   if (filter.token) where.token = filter.token;
   if (filter.cancelled !== undefined) where.cancelled = filter.cancelled;
   if (filter.cursor !== undefined) where.streamId = { lt: filter.cursor };
+  
+  // Amount filters
+  if (filter.minAmount !== undefined || filter.maxAmount !== undefined) {
+    where.totalAmount = {};
+    if (filter.minAmount !== undefined) where.totalAmount.gte = decimal(filter.minAmount);
+    if (filter.maxAmount !== undefined) where.totalAmount.lte = decimal(filter.maxAmount);
+  }
+  
   return where;
 }
 

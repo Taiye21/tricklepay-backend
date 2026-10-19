@@ -159,6 +159,20 @@ function parseCancelled(raw: string | undefined): boolean | undefined {
   return undefined;
 }
 
+// Parses an amount string (non-negative integer). Returns null if invalid, negative, decimal, or non-numeric.
+function parseAmount(raw: string | undefined): bigint | null {
+  if (raw === undefined) return null;
+  const value = raw.trim();
+  if (value.length === 0 || !/^\d+$/.test(value)) return null;
+  try {
+    const parsed = BigInt(value);
+    if (parsed < 0n) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 // Stellar addresses are canonical uppercase base32 strkeys, but callers
 // sometimes send lowercase or whitespace-padded spellings. Normalize those
 // before matching so every rendering of one address filters identically, and
@@ -332,6 +346,16 @@ export async function streamRoutes(
                 "Opaque cursor returned by a previous list response. Use this to fetch the next page " +
                 "with stable ordering under concurrent inserts. Takes precedence over offset when both are provided.",
             },
+            minAmount: {
+              type: "string",
+              description: "Filter streams with total amount greater than or equal to this value (non-negative integer string).",
+              examples: ["1000000"],
+            },
+            maxAmount: {
+              type: "string",
+              description: "Filter streams with total amount less than or equal to this value (non-negative integer string).",
+              examples: ["10000000"],
+            },
           },
           additionalProperties: false,
         },
@@ -351,6 +375,8 @@ export async function streamRoutes(
         includeTotal?: string;
         cancelled?: string;
         cursor?: string;
+        minAmount?: string;
+        maxAmount?: string;
       };
 
       const { limit, offset } = parsePagination(query);
@@ -382,7 +408,10 @@ export async function streamRoutes(
         token?: string;
         cancelled?: boolean;
         cursor?: bigint;
+        minAmount?: bigint;
+        maxAmount?: bigint;
       } = {};
+      
       for (const field of ["sender", "recipient", "token"] as const) {
         const raw = query[field];
         if (!raw) continue;
@@ -395,6 +424,19 @@ export async function streamRoutes(
 
       filter.cancelled = parseCancelled(query.cancelled);
       filter.cursor = cursor;
+      
+      // Parse amount filters
+      const minAmount = parseAmount(query.minAmount);
+      if (query.minAmount !== undefined && minAmount === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid minAmount (must be non-negative integer)");
+      }
+      filter.minAmount = minAmount ?? undefined;
+      
+      const maxAmount = parseAmount(query.maxAmount);
+      if (query.maxAmount !== undefined && maxAmount === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid maxAmount (must be non-negative integer)");
+      }
+      filter.maxAmount = maxAmount ?? undefined;
 
       const includeTotal = parseIncludeTotal(query.includeTotal);
 
