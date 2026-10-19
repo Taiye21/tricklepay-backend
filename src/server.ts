@@ -16,6 +16,7 @@ import { swaggerConfig, swaggerUiConfig } from "./api-spec.js";
 import {
   DEFAULT_RATE_LIMIT_MAX,
   DEFAULT_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_READY_MAX_STALENESS_MS,
   type Config,
 } from "./config.js";
 
@@ -168,7 +169,7 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
   await app.register(swaggerUi, swaggerUiConfig);
 
   // Liveness and readiness probes.
-  registerHealthRoutes(app);
+  registerHealthRoutes(app, config?.readyMaxStalenessMs ?? DEFAULT_READY_MAX_STALENESS_MS);
 
   return app;
 }

@@ -1,11 +1,13 @@
 // ---------------------------------------------------------------------------
 // Health routes (#240).
 //
-// /health � liveness: returns 200 as long as the process is up.
-// /ready  � readiness: checks database connectivity and indexer lag.
+// /health - liveness: returns 200 as long as the process is up.
+// /ready  - readiness: checks database connectivity and indexer lag.
 // ---------------------------------------------------------------------------
 
 import type { FastifyInstance } from "fastify";
+
+import { DEFAULT_READY_MAX_STALENESS_MS } from "./config.js";
 
 import { checkHealth } from "./db.js";
 
@@ -17,8 +19,15 @@ import { serviceVersion } from "./version.js";
  * Registers the `/health` (liveness) and `/ready` (readiness) routes on
  * `app`. These routes do not depend on any route-level plugin and can be
  * registered before or after the OpenAPI plugins.
+ *
+ * @param readyMaxStalenessMs - When positive, /ready returns 503 when the
+ *   indexer position has not moved for longer than this many milliseconds.
+ *   Pass 0 (the default) to disable the staleness check.
  */
-export function registerHealthRoutes(app: FastifyInstance): void {
+export function registerHealthRoutes(
+  app: FastifyInstance,
+  readyMaxStalenessMs = DEFAULT_READY_MAX_STALENESS_MS,
+): void {
   app.get(
     "/health",
     {
@@ -68,6 +77,7 @@ export function registerHealthRoutes(app: FastifyInstance): void {
                 required: ["lagLedgers"],
                 properties: {
                   lagLedgers: { type: ["integer", "null"] },
+                  stalenessMs: { type: ["integer", "null"] },
                 },
               },
             },
@@ -77,7 +87,7 @@ export function registerHealthRoutes(app: FastifyInstance): void {
             required: ["status", "database"],
             properties: {
               status: { type: "string", enum: ["not_ready"] },
-              database: { type: "string", enum: ["down"] },
+              database: { type: "string", enum: ["up", "down"] },
               error: { type: "string" },
             },
           },
@@ -97,11 +107,25 @@ export function registerHealthRoutes(app: FastifyInstance): void {
         return { status: "not_ready", database: "up", error: "indexer has not made progress" };
       }
 
+      const now = Date.now();
+      const stalenessMs = position ? now - position.updatedAt.getTime() : null;
+
+      // Staleness check: if enabled and the position has not been written
+      // within the configured window, the indexer is considered stuck.
+      if (readyMaxStalenessMs > 0 && stalenessMs !== null && stalenessMs > readyMaxStalenessMs) {
+        void reply.status(503);
+        return { status: "not_ready", database: "up", error: "indexer position is stale" };
+      }
+
       const lagLedgers = position
         ? Math.max(0, position.chainLedger - position.lastLedger)
         : null;
 
-      return { status: "ready", database: "up", indexer: { lagLedgers } };
+      return {
+        status: "ready",
+        database: "up",
+        indexer: { lagLedgers, stalenessMs },
+      };
     },
   );
 }

@@ -25,6 +25,7 @@ const CONFIG: Config = {
   trustedProxies: ["10.0.0.0/8"],
   rateLimitMax: 100,
   rateLimitWindowMs: 60000,
+  readyMaxStalenessMs: 0,
 };
 
 // Kept as a literal rather than derived from `describeConfig`, so that adding a
@@ -44,6 +45,7 @@ const EXPECTED_FIELDS = [
   "queryStringLimit",
   "rateLimitMax",
   "rateLimitWindowMs",
+  "readyMaxStalenessMs",
   "rpcUrl",
   "startLedger",
   "summaryCacheTtlMs",

@@ -63,6 +63,10 @@ export const DEFAULT_MAX_PAGES_PER_TICK = 1000;
 // Summary aggregates are expensive and commonly polled, so cache them briefly.
 export const DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS = 2_000;
 
+// Default maximum allowed staleness for the indexer position reported by /ready.
+// 0 means disabled (no staleness check).
+export const DEFAULT_READY_MAX_STALENESS_MS = 0;
+
 // Default request rate limit: 100 requests per client IP per 60-second
 // window, matching docs/request-size-limits.md. Used by loadConfig below and
 // by server.ts when registering the rate-limit plugin.
@@ -116,7 +120,7 @@ function validateRpcUrl(url: string): void {
   if (url.startsWith("http://") && !isLocalUrl(url)) {
     throw new Error(
       `SOROBAN_RPC_URL "${url}" uses plain HTTP on a non-local host. ` +
-        `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
+      `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
     );
   }
 }
@@ -129,7 +133,7 @@ function validateContractId(contractId: string): void {
   if (!StrKey.isValidContract(contractId)) {
     throw new Error(
       `STREAM_CONTRACT_ID "${contractId}" is not a valid Soroban contract address. ` +
-        `Expected a 56-character StrKey contract id starting with "C".`,
+      `Expected a 56-character StrKey contract id starting with "C".`,
     );
   }
 }
@@ -142,7 +146,7 @@ export function validateStartLedger(startLedger: number, chainHead: number): voi
   if (startLedger > chainHead) {
     throw new Error(
       `INDEXER_START_LEDGER ${startLedger} is beyond the chain head ${chainHead}. ` +
-        `The indexer would wait forever with no events. Set INDEXER_START_LEDGER to ${chainHead} or lower.`,
+      `The indexer would wait forever with no events. Set INDEXER_START_LEDGER to ${chainHead} or lower.`,
     );
   }
 }
@@ -165,6 +169,7 @@ export interface Config {
   readonly trustedProxies: readonly string[];
   readonly rateLimitMax?: number;
   readonly rateLimitWindowMs?: number;
+  readonly readyMaxStalenessMs: number;
 }
 
 export function loadConfig(): Config {
@@ -219,6 +224,8 @@ export function loadConfig(): Config {
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
     rateLimitMax,
     rateLimitWindowMs,
+    // Staleness threshold for the /ready endpoint. 0 = disabled.
+    readyMaxStalenessMs: integer("READY_MAX_STALENESS_MS", DEFAULT_READY_MAX_STALENESS_MS),
   };
 }
 
@@ -295,5 +302,6 @@ export function describeConfig(config: Config): LoggedConfig {
     // Undefined when rate limiting is not configured; pino omits the field.
     rateLimitMax: config.rateLimitMax,
     rateLimitWindowMs: config.rateLimitWindowMs,
+    readyMaxStalenessMs: config.readyMaxStalenessMs,
   };
 }
