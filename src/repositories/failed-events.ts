@@ -85,6 +85,11 @@ export async function listFailedEvents({ limit = 100 }: { limit?: number } = {})
   });
 }
 
+// Returns a single failed event row by its eventId, or null when not found.
+export async function getFailedEventById(eventId: string) {
+  return prisma.failedEvent.findUnique({ where: { eventId } });
+}
+
 // Builds a FailedEventInput from a decoded event and an error.
 export function failedEventFromDecoded(
   event: StreamEvent,
