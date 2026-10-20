@@ -540,6 +540,7 @@ rest of the page can continue without stopping indexing. Each row stores:
 - `kind`: the decoded event kind, or `"unknown"` if decoding failed first
 - `streamId`: the target stream, when available, encoded as a string
 - `ledger`: the ledger in which the event was observed
+- `txHash`: the transaction hash when available; null for older rows or unavailable hashes
 - `error`: the most recent exception text from the failed attempt
 - `failureCount`: how many times this event has failed
 - `firstFailedAt` / `lastFailedAt`: timestamps for the first and latest failure
@@ -555,7 +556,7 @@ replay command as a dry run:
 
 ```bash
 # see the oldest unresolved failures first
-psql "$DATABASE_URL" -c 'SELECT "eventId", "kind", "streamId", "ledger", "failureCount", "error" FROM "FailedEvent" ORDER BY "ledger" ASC LIMIT 20;'
+psql "$DATABASE_URL" -c 'SELECT "eventId", "kind", "streamId", "ledger", "txHash", "failureCount", "error" FROM "FailedEvent" ORDER BY "ledger" ASC LIMIT 20;'
 
 # count unresolved failures
 psql "$DATABASE_URL" -c 'SELECT COUNT(*) FROM "FailedEvent";'

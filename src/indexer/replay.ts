@@ -87,6 +87,7 @@ export async function replayFailedEvents(
 
   for (const row of rows) {
     attempted += 1;
+    let txHash = row.txHash;
 
     try {
       const event = await findEventForRetry(server, contractId, row.eventId, row.ledger, maxPages);
@@ -100,6 +101,7 @@ export async function replayFailedEvents(
             kind: row.kind,
             streamId: row.streamId,
             ledger: row.ledger,
+            txHash,
             error: message,
           });
         }
@@ -107,6 +109,7 @@ export async function replayFailedEvents(
         continue;
       }
 
+      txHash = event.txHash;
       const applyResult = dryRun
         ? "would-apply"
         : await prisma.$transaction(async (tx) => {
@@ -142,6 +145,7 @@ export async function replayFailedEvents(
             kind: row.kind,
             streamId: row.streamId,
             ledger: row.ledger,
+            txHash,
             error: message,
           });
         }
@@ -157,6 +161,7 @@ export async function replayFailedEvents(
           kind: row.kind,
           streamId: row.streamId,
           ledger: row.ledger,
+          txHash,
           error: message,
         });
       }
