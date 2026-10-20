@@ -46,7 +46,6 @@ import {
   tokenSummarySchema,
 } from "../schema.js";
 import { listIndexedEvents, type IndexedEventKind } from "../repositories/indexed-events.js";
-import { vestedAmount } from "../lib/vesting.js";
 import { nowSeconds } from "../lib/time.js";
 import { vestedAmount, withdrawableAmount } from "../lib/vesting.js";
 import { DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS } from "../config.js";
@@ -261,6 +260,7 @@ export async function streamRoutes(
   }
   if (!app.getSchema(ACCOUNT_SUMMARY_RESPONSE_SCHEMA_ID)) {
     app.addSchema(accountSummaryResponseSchema);
+  }
   if (!app.getSchema(STREAM_SCHEDULE_RESPONSE_SCHEMA_ID)) {
     app.addSchema(streamScheduleResponseSchema);
   }
@@ -273,6 +273,7 @@ export async function streamRoutes(
         summary: "List streams",
         description:
           "Returns a paginated list of token streams. Optionally filter by sender, recipient, or token address; " +
+          "ids accepts up to 100 comma-separated uint64 stream ids; unknown ids are omitted. " +
           "address filters accept lowercase and whitespace-padded spellings and are normalized before matching. " +
           "Use the opaque cursor returned by previous responses for stable pagination under concurrent inserts; " +
           "when cursor is provided, offset is ignored and offset ceiling checks are skipped. " +
@@ -284,6 +285,14 @@ export async function streamRoutes(
         querystring: {
           type: "object",
           properties: {
+            ids: {
+              type: "string",
+              description:
+                "Comma-separated uint64 stream ids (1 to 100 entries). Invalid ids or more than 100 entries return 400. " +
+                "Unknown ids are omitted and duplicates return one stream. Other filters and pagination still apply; " +
+                "use limit=100 to retrieve up to 100 matches in one page.",
+              examples: ["1,2,3"],
+            },
             sender: {
               type: "string",
               description:
@@ -343,6 +352,7 @@ export async function streamRoutes(
     },
     async (request, reply) => {
       const query = request.query as {
+        ids?: string;
         sender?: string;
         recipient?: string;
         token?: string;
@@ -377,12 +387,28 @@ export async function streamRoutes(
       }
 
       const filter: {
+        ids?: bigint[];
         sender?: string;
         recipient?: string;
         token?: string;
         cancelled?: boolean;
         cursor?: bigint;
       } = {};
+      if (query.ids !== undefined) {
+        const parts = query.ids.split(",");
+        if (parts.length > 100) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "ids must contain at most 100 stream ids");
+        }
+        const ids: bigint[] = [];
+        for (const part of parts) {
+          const id = parseStreamId(part);
+          if (id === null) {
+            return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id in ids");
+          }
+          ids.push(id);
+        }
+        filter.ids = [...new Set(ids)];
+      }
       for (const field of ["sender", "recipient", "token"] as const) {
         const raw = query[field];
         if (!raw) continue;
