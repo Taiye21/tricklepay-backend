@@ -7,11 +7,15 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 project="tricklepay-smoke-$(date +%s)-$$"
 compose=(docker compose -p "$project" -f docker-compose.smoke.yml --profile test)
 export STREAM_CONTRACT_ID="${STREAM_CONTRACT_ID:-CDMB62RVYAXJJNYYH7K442SHSAJIXTZ6K7JANGSMQF2T7MHCTVSK75SW}"
+container=""
 
 cleanup() {
   result=$?
   trap - EXIT
   if (( result != 0 )); then
+    if [[ -n "$container" ]]; then
+      docker inspect --format '{{json .State}}' "$container" >&2 || true
+    fi
     "${compose[@]}" logs --no-color >&2 || true
   fi
   if ! "${compose[@]}" down --volumes --rmi local --timeout 10; then

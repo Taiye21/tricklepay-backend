@@ -639,7 +639,8 @@ Requires Docker, Docker Compose 2.24.4+, and internet access to the testnet
 Soroban RPC endpoint. The script builds the image and runs the Compose migration
 and startup command against an isolated `test` profile database, then waits up
 to 120 seconds for the image's health check to report `healthy`. It prints
-container logs on failure and removes its containers, database storage, network,
+container logs and the API container's health check diagnostics on failure,
+and removes its containers, database storage, network,
 and locally built image on exit. It publishes no host ports and leaves existing
 development and integration-test containers alone. `STREAM_CONTRACT_ID` may be
 set to a testnet contract; otherwise a valid placeholder address is used since
