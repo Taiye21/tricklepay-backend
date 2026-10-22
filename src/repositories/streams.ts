@@ -288,13 +288,13 @@ function whereFromFilter(filter: StreamFilter, now?: bigint): Prisma.StreamWhere
   if (filter.token) where.token = filter.token;
   if (filter.cancelled !== undefined) where.cancelled = filter.cancelled;
   if (filter.cursor !== undefined) where.streamId = { lt: filter.cursor };
-  
+
   // Apply status filter using the same predicates as the summary endpoint
   if (filter.status && now !== undefined) {
     const statusFilter = statusWhereFilter(filter.status, now);
     Object.assign(where, statusFilter);
   }
-  
+
   return where;
 }
 
@@ -327,7 +327,7 @@ export function statusWhere(status: StreamStatus, now: bigint): Prisma.StreamWhe
   }
 }
 
-export async function listStreams(filter: StreamFilter): Promise<StreamListResult> {
+export async function listStreams(filter: StreamFilter, now?: bigint): Promise<StreamListResult> {
   const limit = filter.limit ?? 50;
   const useCursor = filter.cursor !== undefined;
   const take = limit + 1;

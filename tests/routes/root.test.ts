@@ -24,6 +24,7 @@ const mockConfig = {
   queryStringLimit: 2048,
   compressionThresholdBytes: 1024,
   trustedProxies: [],
+  rateLimitAllowlist: [],
   summaryCacheTtlMs: 2000,
   readinessRetryAfterSeconds: 5,
   enableDocsUi: true,

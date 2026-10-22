@@ -210,6 +210,7 @@ interface ListStreamsQuery {
   offset?: string;
   includeTotal?: string;
   cancelled?: string;
+  status?: StreamStatus;
   cursor?: string;
 }
 
@@ -219,6 +220,11 @@ export async function streamRoutes(
 ): Promise<void> {
   const summaryCacheTtlMs = opts.summaryCacheTtlMs ?? DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS;
   let cachedSummary: { payload: SummaryPayload; createdAt: number } | null = null;
+  // When a recomputation is already in-flight, all concurrent callers wait on
+  // the same Promise instead of each running their own four aggregate queries.
+  // A failed computation is never stored; the waiting callers all receive the
+  // same rejection so no stale data leaks through.
+  let inFlightSummary: Promise<SummaryPayload> | null = null;
 
   // Ensure the shared schemas are available whether this plugin is registered
   // on a full server (which calls addSchema centrally) or a bare Fastify
@@ -379,7 +385,7 @@ export async function streamRoutes(
       }
 
       filter.cancelled = parseCancelled(query.cancelled);
-      
+
       // Parse and validate status filter
       if (query.status) {
         const status = query.status;
@@ -388,16 +394,20 @@ export async function streamRoutes(
         }
         filter.status = status;
       }
-      
+
       filter.cursor = cursor;
 
       const includeTotal = parseIncludeTotal(query.includeTotal);
-      
+
       const now = nowSeconds();
 
       const [listResult, total] = await Promise.all([
-        listStreams({ ...filter, limit, offset }, now),
-        includeTotal ? countStreams(filter, now) : Promise.resolve(undefined),
+        filter.status
+          ? listStreams({ ...filter, limit, offset }, now)
+          : listStreams({ ...filter, limit, offset }),
+        includeTotal
+          ? filter.status ? countStreams(filter, now) : countStreams(filter)
+          : Promise.resolve(undefined),
       ]);
 
       reply.header("Cache-Control", "public, max-age=30");
@@ -448,29 +458,52 @@ export async function streamRoutes(
         }
       }
 
-      const now = nowSeconds();
-      const entries = await Promise.all(
-        SUMMARY_STATUSES.map(async (status) => {
-          const aggregate = await aggregateStreams(statusWhere(status, now));
-          return [
-            status,
-            {
-              count: aggregate.count,
-              totalAmount: aggregate.totalAmount.toString(),
-              withdrawn: aggregate.withdrawn.toString(),
-            },
-          ] as const;
-        }),
-      );
+      // If another request is already computing the summary, share its result
+      // instead of running a duplicate set of aggregate queries.
+      if (inFlightSummary !== null) {
+        const payload = await inFlightSummary;
+        const ageMs = Date.now() - (cachedSummary?.createdAt ?? 0);
+        const maxAgeSeconds = Math.max(0, Math.floor((summaryCacheTtlMs - ageMs) / 1000));
+        reply.header("Cache-Control", `public, max-age=${maxAgeSeconds}`);
+        return payload;
+      }
 
-      const payload = Object.fromEntries(entries) as SummaryPayload;
-      const createdAt = Date.now();
-      if (summaryCacheTtlMs > 0) cachedSummary = { payload, createdAt };
-      reply.header(
-        "Cache-Control",
-        `public, max-age=${Math.floor(summaryCacheTtlMs / 1000)}`,
-      );
-      return payload;
+      // This request is the first to notice the cache is stale — it owns the
+      // computation. Build the promise, store it so concurrent arrivals can
+      // attach, then await it ourselves.
+      const compute = async (): Promise<SummaryPayload> => {
+        const now = nowSeconds();
+        const entries = await Promise.all(
+          SUMMARY_STATUSES.map(async (status) => {
+            const aggregate = await aggregateStreams(statusWhere(status, now));
+            return [
+              status,
+              {
+                count: aggregate.count,
+                totalAmount: aggregate.totalAmount.toString(),
+                withdrawn: aggregate.withdrawn.toString(),
+              },
+            ] as const;
+          }),
+        );
+        return Object.fromEntries(entries) as SummaryPayload;
+      };
+
+      inFlightSummary = compute();
+      try {
+        const payload = await inFlightSummary;
+        const createdAt = Date.now();
+        if (summaryCacheTtlMs > 0) cachedSummary = { payload, createdAt };
+        reply.header(
+          "Cache-Control",
+          `public, max-age=${Math.floor(summaryCacheTtlMs / 1000)}`,
+        );
+        return payload;
+      } finally {
+        // Always clear the in-flight slot so the next expiry triggers a fresh
+        // computation. On failure this ensures no stale promise is reused.
+        inFlightSummary = null;
+      }
     },
   );
 
