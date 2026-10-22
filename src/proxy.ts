@@ -139,6 +139,55 @@ function matchesIpv6Cidr(address: string, cidr: string): boolean {
 }
 
 /**
+ * Parses the RATE_LIMIT_ALLOWLIST setting: a comma-separated list of IP
+ * addresses or IPv4 CIDR blocks. Shares the same validation rules as
+ * TRUSTED_PROXIES so operators only need to learn one syntax.
+ */
+export function parseAllowlist(raw: string | undefined): string[] {
+  if (!raw || raw.trim() === "") return [];
+  const entries = raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+
+  for (const entry of entries) {
+    const [address] = entry.split("/");
+    if (isIP(address) === 0) {
+      throw new Error(
+        `RATE_LIMIT_ALLOWLIST entry "${entry}" is not a valid IP address or CIDR block`,
+      );
+    }
+    if (entry.includes("/")) {
+      if (!entry.includes(".")) {
+        throw new Error(
+          `RATE_LIMIT_ALLOWLIST entry "${entry}" is not a valid IPv4 CIDR block`,
+        );
+      }
+      const prefix = Number(entry.split("/")[1]);
+      if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) {
+        throw new Error(
+          `RATE_LIMIT_ALLOWLIST entry "${entry}" has an invalid CIDR prefix; expected 0-32`,
+        );
+      }
+    }
+  }
+
+  return entries;
+}
+
+/**
+ * True when `address` is covered by the configured rate-limit allowlist and
+ * should bypass rate limiting entirely.
+ */
+export function isAllowlistedAddress(
+  address: string,
+  allowlist: readonly string[],
+): boolean {
+  // Re-uses the same matching logic as isTrustedProxyAddress.
+  return isTrustedProxyAddress(address, allowlist);
+}
+
+/**
  * True when `address` (the direct connection peer) is covered by the
  * configured trusted proxy list.
  */
