@@ -75,6 +75,10 @@ export const DEFAULT_MAX_PAGES_PER_TICK = 1000;
 // Summary aggregates are expensive and commonly polled, so cache them briefly.
 export const DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS = 2_000;
 
+// Default maximum allowed staleness for the indexer position reported by /ready.
+// 0 means disabled (no staleness check).
+export const DEFAULT_READY_MAX_STALENESS_MS = 0;
+
 // Default request rate limit: 100 requests per client IP per 60-second
 // window, matching docs/request-size-limits.md. Used by loadConfig below and
 // by server.ts when registering the rate-limit plugin.
@@ -248,6 +252,7 @@ export interface Config {
   readonly trustedProxies: readonly string[];
   readonly rateLimitMax?: number;
   readonly rateLimitWindowMs?: number;
+  readonly readyMaxStalenessMs: number;
   readonly rateLimitAllowlist: readonly string[];
   readonly maxTrackedRateLimitClients?: number;
   readonly readinessRetryAfterSeconds: number;
@@ -329,6 +334,8 @@ export function loadConfig(): Config {
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
     rateLimitMax,
     rateLimitWindowMs,
+    // Staleness threshold for the /ready endpoint. 0 = disabled.
+    readyMaxStalenessMs: integer("READY_MAX_STALENESS_MS", DEFAULT_READY_MAX_STALENESS_MS),
     // Addresses that bypass the rate limiter entirely (#allowlist).
     rateLimitAllowlist: parseAllowlist(process.env.RATE_LIMIT_ALLOWLIST),
     readinessRetryAfterSeconds,
@@ -417,6 +424,7 @@ export function describeConfig(config: Config): LoggedConfig {
     // Undefined when rate limiting is not configured; pino omits the field.
     rateLimitMax: config.rateLimitMax,
     rateLimitWindowMs: config.rateLimitWindowMs,
+    readyMaxStalenessMs: config.readyMaxStalenessMs,
     rateLimitAllowlist: config.rateLimitAllowlist,
     maxTrackedRateLimitClients: config.maxTrackedRateLimitClients,
     // Never log the secret itself, only whether one is configured.

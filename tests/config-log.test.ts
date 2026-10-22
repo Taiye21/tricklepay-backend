@@ -28,6 +28,7 @@ const CONFIG: Config = {
   rateLimitAllowlist: [],
   rateLimitMax: 100,
   rateLimitWindowMs: 60000,
+  readyMaxStalenessMs: 0,
   readinessRetryAfterSeconds: 5,
   enableDocsUi: true,
 };
@@ -58,6 +59,7 @@ const EXPECTED_FIELDS = [
   "rateLimitMax",
   "rateLimitWindowMs",
   "readinessRetryAfterSeconds",
+  "readyMaxStalenessMs",
   "requestTimeoutMs",
   "rpcUrl",
   "startLedger",

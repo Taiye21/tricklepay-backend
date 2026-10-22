@@ -21,6 +21,7 @@ import {
   DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   DEFAULT_RATE_LIMIT_WINDOW_MS,
+  DEFAULT_READY_MAX_STALENESS_MS,
   DEFAULT_READINESS_RETRY_AFTER_SECONDS,
   DEFAULT_COMPRESSION_THRESHOLD_BYTES,
   defaultPublicBaseUrl,
@@ -264,7 +265,11 @@ export async function buildServer(config?: Partial<Config>): Promise<FastifyInst
   }
 
   // Liveness and readiness probes.
-  registerHealthRoutes(app, readinessRetryAfterSeconds);
+  registerHealthRoutes(
+    app,
+    readinessRetryAfterSeconds,
+    config?.readyMaxStalenessMs ?? DEFAULT_READY_MAX_STALENESS_MS,
+  );
 
   return app;
 }

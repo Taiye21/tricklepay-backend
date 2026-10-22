@@ -27,6 +27,7 @@ const mockConfig = {
   rateLimitAllowlist: [],
   summaryCacheTtlMs: 2000,
   readinessRetryAfterSeconds: 5,
+  readyMaxStalenessMs: 0,
   enableDocsUi: true,
 };
 
