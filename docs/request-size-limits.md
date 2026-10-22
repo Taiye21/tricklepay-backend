@@ -21,6 +21,7 @@ Both limits are configurable via environment variables and have sensible default
 | `RATE_LIMIT_MAX` | `100` | Maximum requests per client IP per rate-limit window |
 | `RATE_LIMIT_WINDOW_MS` | `60000` (1 minute) | Duration of the fixed request rate-limit window in milliseconds |
 | `RATE_LIMIT_ALLOWLIST` | _(empty)_ | Comma-separated IPs or IPv4 CIDR blocks that bypass the rate limiter |
+| `COMPRESSION_THRESHOLD_BYTES` | `1024` (1 KB) | Minimum response size in bytes before it is compressed for clients that accept `gzip` or `br` |
 
 ### Setting Custom Limits
 
@@ -39,6 +40,8 @@ RATE_LIMIT_WINDOW_MS=60000
 
 # Exempt monitoring and SSR servers from rate limiting
 RATE_LIMIT_ALLOWLIST=10.0.0.5,10.0.1.0/24
+# Compress responses of 1KB or larger
+COMPRESSION_THRESHOLD_BYTES=1024
 ```
 
 **Note:** Values are in bytes. Common conversions:
@@ -132,6 +135,16 @@ http://localhost:3000/streams?limit=50&offset=100
                               This part is measured (24 bytes)
 ```
 
+## Response Compression
+
+Response size is separate from the request limits above, but it is controlled by a related threshold. Large list responses (for example `/streams` with 100 streams) are mostly repetitive JSON, so the service registers `@fastify/compress` and compresses any response at or above `COMPRESSION_THRESHOLD_BYTES` (default `1024`) when the client advertises `gzip` or `br` via `Accept-Encoding`.
+
+- **Above the threshold, client accepts gzip/brotli:** the response carries a `Content-Encoding` header (`gzip` or `br`) and a compressed body.
+- **Below the threshold:** the response is sent uncompressed, because the encoding overhead would outweigh the saving for small bodies.
+- **Client does not opt in:** the response is sent uncompressed regardless of size.
+
+Compression cuts transfer size for clients on metered or slow links. The threshold is configurable via `COMPRESSION_THRESHOLD_BYTES`; lower it to compress more responses, or raise it if CPU cost on the server matters more than transfer size.
+
 ## Why These Limits Exist
 
 1. **Body limit:** Prevents memory exhaustion from unbounded request payloads. Without a cap, a malicious or misconfigured client could send gigabytes of data, exhausting memory or disk.
@@ -172,6 +185,7 @@ grep "req-1234" logs/app.log
 
 - **Body limit:** Enforced by Fastify's built-in `bodyLimit` option, which reads from `config.bodyLimit`.
 - **Query string limit:** Enforced by a custom `onRequest` hook in `src/server.ts` that measures the raw query string length before parsing.
+- **Compression threshold:** Enforced by `@fastify/compress`, registered in `src/server.ts` with `threshold` read from `config.compressionThresholdBytes`.
 
 See `src/config.ts` for the default values and `src/server.ts` for the rejection logic.
 
