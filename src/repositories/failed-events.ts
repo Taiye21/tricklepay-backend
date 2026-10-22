@@ -25,6 +25,8 @@ export interface FailedEventInput {
   // The stream id as a string (bigint cannot be stored directly in JSON/text).
   streamId: string | null;
   ledger: number;
+  // Transaction hash when available; older callers may omit it.
+  txHash?: string | null;
   // The error message from the most recent failure.
   error: string;
 }
@@ -40,10 +42,12 @@ export async function recordFailedEvent(input: FailedEventInput): Promise<void> 
       kind: input.kind,
       streamId: input.streamId,
       ledger: input.ledger,
+      txHash: input.txHash ?? null,
       error: input.error,
       failureCount: 1,
     },
     update: {
+      txHash: input.txHash ?? undefined,
       error: input.error,
       failureCount: { increment: 1 },
     },
@@ -95,6 +99,7 @@ export function failedEventFromDecoded(
     kind: event.kind,
     streamId: event.streamId.toString(),
     ledger: event.ledger,
+    txHash: event.txHash,
     error: error instanceof Error ? error.message : String(error),
   };
 }

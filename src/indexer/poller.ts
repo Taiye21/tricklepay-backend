@@ -290,6 +290,7 @@ export class Poller {
               kind: "malformed",
               streamId: "0",
               ledger: raw.ledger ?? 0,
+              txHash: raw.txHash ?? null,
               error: err.message,
             });
           } catch (recordErr) {
