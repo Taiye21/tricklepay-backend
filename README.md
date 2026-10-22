@@ -1,6 +1,6 @@
 # TricklePay Backend
 
-Indexer and read API for TricklePay token streams on Stellar.
+Indexer and read API for TricklePay token streams on Stellar
 
 This service has two halves that run in one process:
 
