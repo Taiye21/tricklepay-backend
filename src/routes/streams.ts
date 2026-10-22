@@ -1,6 +1,8 @@
 // Registers the GET /streams, GET /streams/summary, GET /tokens, GET /streams/:id/events, and GET /streams/:id endpoints.
 // These routes read stream records, historical events, and aggregations from the database.
 
+import { createHash } from "node:crypto";
+
 import { Prisma, type Stream } from "@prisma/client";
 
 import { StrKey } from "@stellar/stellar-sdk";
@@ -10,6 +12,7 @@ import type { FastifyInstance } from "fastify";
 import { sendError, bigIntToStringNullable } from "../lib/response.js";
 import { parsePagination } from "../lib/pagination.js";
 import { mapStreamResponse } from "../lib/stream-view.js";
+import { MAX_UINT64, parseStreamId } from "../lib/stream-id.js";
 
 import {
   aggregateStreams,
@@ -19,6 +22,7 @@ import {
   getStream,
   listStreams,
   listTokens,
+  statusWhere,
 } from "../repositories/streams.js";
 
 import {
@@ -46,6 +50,7 @@ import {
   tokenSummarySchema,
 } from "../schema.js";
 import { listIndexedEvents, type IndexedEventKind } from "../repositories/indexed-events.js";
+import { normalizeAddress } from "../lib/address.js";
 import { nowSeconds } from "../lib/time.js";
 import { vestedAmount, withdrawableAmount } from "../lib/vesting.js";
 import { DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS } from "../config.js";
@@ -54,27 +59,20 @@ import { DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS } from "../config.js";
 // through results in order or narrow them with filters instead.
 const MAX_OFFSET = 10000;
 
+// Weak ETag for list responses, derived from the serialized body so it changes
+// whenever any returned field changes (streams, total, nextCursor, pagination).
+// "Weak" (W/) is correct here: the body is byte-identical between revalidations
+// for the same data, but we only guarantee semantic equivalence, matching the
+// detail route's revalidation model without a per-row version column.
+function weakEtagFromBody(body: unknown): string {
+  const digest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+  return `W/"${digest}"`;
+}
+
 type StreamStatus = "pending" | "streaming" | "completed" | "cancelled";
 
 function parseIncludeTotal(raw: string | undefined): boolean {
   return raw === "true";
-}
-
-const MAX_UINT64 = 18446744073709551615n;
-
-function parseStreamId(raw: string | undefined): bigint | null {
-  if (raw === undefined) return null;
-
-  const value = raw.trim();
-  if (value.length === 0 || !/^\d+$/.test(value)) return null;
-
-  try {
-    const parsed = BigInt(value);
-    if (parsed < 0n || parsed > MAX_UINT64) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
 }
 
 function parseAtTimestamp(raw: string | undefined): bigint | null {
@@ -158,19 +156,6 @@ function parseCancelled(raw: string | undefined): boolean | undefined {
   return undefined;
 }
 
-// Stellar addresses are canonical uppercase base32 strkeys, but callers
-// sometimes send lowercase or whitespace-padded spellings. Normalize those
-// before matching so every rendering of one address filters identically, and
-// reject values that are neither a valid account nor a valid contract address.
-// Returns null when the input cannot be normalized safely.
-function normalizeAddress(raw: string): string | null {
-  const candidate = raw.trim().toUpperCase();
-  if (StrKey.isValidEd25519PublicKey(candidate) || StrKey.isValidContract(candidate)) {
-    return candidate;
-  }
-  return null;
-}
-
 const SUMMARY_STATUSES = ["pending", "streaming", "completed", "cancelled"] as const;
 
 type SummaryEntry = { count: number; totalAmount: string; withdrawn: string };
@@ -214,19 +199,20 @@ export type StreamRoutesOptions = {
   summaryCacheTtlMs?: number;
 };
 
-// The database-side predicate for each lifecycle status, mirroring `statusOf`:
-// cancelled wins first, then the start/end time windows against the clock.
-function statusWhere(status: StreamStatus, now: bigint): Prisma.StreamWhereInput {
-  switch (status) {
-    case "cancelled":
-      return { cancelled: true };
-    case "pending":
-      return { cancelled: false, startTime: { gt: now } };
-    case "completed":
-      return { cancelled: false, endTime: { lte: now } };
-    case "streaming":
-      return { cancelled: false, startTime: { lte: now }, endTime: { gt: now } };
-  }
+// Mirrors the `querystring` JSON schema on GET /streams below field for
+// field, so a parameter renamed in one place without the other is a compile
+// error instead of a silently-undefined value at runtime.
+interface ListStreamsQuery {
+  ids?: string;
+  sender?: string;
+  recipient?: string;
+  token?: string;
+  limit?: string;
+  offset?: string;
+  includeTotal?: string;
+  cancelled?: string;
+  status?: StreamStatus;
+  cursor?: string;
 }
 
 export async function streamRoutes(
@@ -235,6 +221,11 @@ export async function streamRoutes(
 ): Promise<void> {
   const summaryCacheTtlMs = opts.summaryCacheTtlMs ?? DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS;
   let cachedSummary: { payload: SummaryPayload; createdAt: number } | null = null;
+  // When a recomputation is already in-flight, all concurrent callers wait on
+  // the same Promise instead of each running their own four aggregate queries.
+  // A failed computation is never stored; the waiting callers all receive the
+  // same rejection so no stale data leaks through.
+  let inFlightSummary: Promise<SummaryPayload> | null = null;
 
   // Ensure the shared schemas are available whether this plugin is registered
   // on a full server (which calls addSchema centrally) or a bare Fastify
@@ -266,7 +257,7 @@ export async function streamRoutes(
   }
   if (!app.getSchema(ERROR_SCHEMA_ID)) app.addSchema(apiErrorSchema);
 
-  app.get(
+  app.get<{ Querystring: ListStreamsQuery }>(
     "/streams",
     {
       schema: {
@@ -280,7 +271,8 @@ export async function streamRoutes(
           "Results are returned in a stable deterministic order: when filtering by sender, recipient, or token, " +
           "results are ordered by that address ascending, then by stream id descending to break ties. " +
           "Unfiltered queries (or queries filtered only by cancellation status) are ordered by stream id descending. " +
-          "Stream id is the final tie-breaker in all cases so pagination is cacheable and repeatable.",
+          "Stream id is the final tie-breaker in all cases so pagination is cacheable and repeatable. " +
+          "Responses carry a weak ETag derived from the body; send it back as If-None-Match to get a 304 with no body when nothing changed.",
         tags: ["streams"],
         querystring: {
           type: "object",
@@ -335,6 +327,13 @@ export async function streamRoutes(
               description:
                 "Filter by cancellation status. Omit to return both cancelled and active streams.",
             },
+            status: {
+              type: "string",
+              enum: ["pending", "streaming", "completed", "cancelled"],
+              description:
+                "Filter by lifecycle status. pending: not yet started, streaming: currently active, " +
+                "completed: ended naturally, cancelled: terminated early. Combines with other filters.",
+            },
             cursor: {
               type: "string",
               description:
@@ -346,22 +345,13 @@ export async function streamRoutes(
         },
         response: {
           200: { $ref: STREAM_LIST_RESPONSE_SCHEMA_ID },
+          304: { type: "null" },
           400: { $ref: ERROR_SCHEMA_ID },
         },
       },
     },
     async (request, reply) => {
-      const query = request.query as {
-        ids?: string;
-        sender?: string;
-        recipient?: string;
-        token?: string;
-        limit?: string;
-        offset?: string;
-        includeTotal?: string;
-        cancelled?: string;
-        cursor?: string;
-      };
+      const query = request.query;
 
       const { limit, offset } = parsePagination(query);
 
@@ -392,6 +382,7 @@ export async function streamRoutes(
         recipient?: string;
         token?: string;
         cancelled?: boolean;
+        status?: "pending" | "streaming" | "completed" | "cancelled";
         cursor?: bigint;
       } = {};
       if (query.ids !== undefined) {
@@ -420,23 +411,51 @@ export async function streamRoutes(
       }
 
       filter.cancelled = parseCancelled(query.cancelled);
+
+      // Parse and validate status filter
+      if (query.status) {
+        const status = query.status;
+        if (status !== "pending" && status !== "streaming" && status !== "completed" && status !== "cancelled") {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "status must be one of: pending, streaming, completed, cancelled");
+        }
+        filter.status = status;
+      }
+
       filter.cursor = cursor;
 
       const includeTotal = parseIncludeTotal(query.includeTotal);
 
+      const now = nowSeconds();
+
       const [listResult, total] = await Promise.all([
-        listStreams({ ...filter, limit, offset }),
-        includeTotal ? countStreams(filter) : Promise.resolve(undefined),
+        filter.status
+          ? listStreams({ ...filter, limit, offset }, now)
+          : listStreams({ ...filter, limit, offset }),
+        includeTotal
+          ? filter.status ? countStreams(filter, now) : countStreams(filter)
+          : Promise.resolve(undefined),
       ]);
 
       reply.header("Cache-Control", "public, max-age=30");
-      return {
+
+      // Built once and reused for both the ETag and the returned body so the
+      // digest is derived from exactly the bytes the client would receive.
+      const body = {
         streams: listResult.streams.map((s) => mapStreamResponse(s)),
         ...(total === undefined ? {} : { total }),
         ...(listResult.nextCursor === undefined ? {} : { nextCursor: listResult.nextCursor }),
         limit,
         offset: usingCursor ? 0 : offset,
       };
+
+      const etag = weakEtagFromBody(body);
+      reply.header("ETag", etag);
+
+      if (request.headers["if-none-match"] === etag) {
+        return reply.code(304).send();
+      }
+
+      return body;
     },
   );
 
@@ -465,29 +484,52 @@ export async function streamRoutes(
         }
       }
 
-      const now = nowSeconds();
-      const entries = await Promise.all(
-        SUMMARY_STATUSES.map(async (status) => {
-          const aggregate = await aggregateStreams(statusWhere(status, now));
-          return [
-            status,
-            {
-              count: aggregate.count,
-              totalAmount: aggregate.totalAmount.toString(),
-              withdrawn: aggregate.withdrawn.toString(),
-            },
-          ] as const;
-        }),
-      );
+      // If another request is already computing the summary, share its result
+      // instead of running a duplicate set of aggregate queries.
+      if (inFlightSummary !== null) {
+        const payload = await inFlightSummary;
+        const ageMs = Date.now() - (cachedSummary?.createdAt ?? 0);
+        const maxAgeSeconds = Math.max(0, Math.floor((summaryCacheTtlMs - ageMs) / 1000));
+        reply.header("Cache-Control", `public, max-age=${maxAgeSeconds}`);
+        return payload;
+      }
 
-      const payload = Object.fromEntries(entries) as SummaryPayload;
-      const createdAt = Date.now();
-      if (summaryCacheTtlMs > 0) cachedSummary = { payload, createdAt };
-      reply.header(
-        "Cache-Control",
-        `public, max-age=${Math.floor(summaryCacheTtlMs / 1000)}`,
-      );
-      return payload;
+      // This request is the first to notice the cache is stale — it owns the
+      // computation. Build the promise, store it so concurrent arrivals can
+      // attach, then await it ourselves.
+      const compute = async (): Promise<SummaryPayload> => {
+        const now = nowSeconds();
+        const entries = await Promise.all(
+          SUMMARY_STATUSES.map(async (status) => {
+            const aggregate = await aggregateStreams(statusWhere(status, now));
+            return [
+              status,
+              {
+                count: aggregate.count,
+                totalAmount: aggregate.totalAmount.toString(),
+                withdrawn: aggregate.withdrawn.toString(),
+              },
+            ] as const;
+          }),
+        );
+        return Object.fromEntries(entries) as SummaryPayload;
+      };
+
+      inFlightSummary = compute();
+      try {
+        const payload = await inFlightSummary;
+        const createdAt = Date.now();
+        if (summaryCacheTtlMs > 0) cachedSummary = { payload, createdAt };
+        reply.header(
+          "Cache-Control",
+          `public, max-age=${Math.floor(summaryCacheTtlMs / 1000)}`,
+        );
+        return payload;
+      } finally {
+        // Always clear the in-flight slot so the next expiry triggers a fresh
+        // computation. On failure this ensures no stale promise is reused.
+        inFlightSummary = null;
+      }
     },
   );
 

@@ -107,6 +107,16 @@ describe("GET /streams ids filter", () => {
       ids: [1n, 2n], cancelled: false, limit: 1, cursor: 5n,
     }));
   });
+
+  it("passes ids and lifecycle status to list and count with the same timestamp", async () => {
+    const response = await get("/streams?ids=1,3&status=streaming&includeTotal=true");
+    expect(response.statusCode).toBe(200);
+    const now = streamsRepo.listStreams.mock.calls[0][1];
+    expect(typeof now).toBe("bigint");
+    const filter = expect.objectContaining({ ids: [1n, 3n], status: "streaming" });
+    expect(streamsRepo.listStreams).toHaveBeenCalledWith(filter, now);
+    expect(streamsRepo.countStreams).toHaveBeenCalledWith(filter, now);
+  });
 });
 
 describe("GET /streams unknown query parameters", () => {

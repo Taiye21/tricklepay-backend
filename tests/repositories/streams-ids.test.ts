@@ -32,5 +32,21 @@ describe("streams repository ids filter", () => {
       where: { streamId: { in: [1n] } },
     }));
   });
+
+  it("combines ids and cursor with lifecycle status for lists and totals", async () => {
+    const findMany = vi.spyOn(prisma.stream, "findMany").mockResolvedValueOnce([]);
+    const count = vi.spyOn(prisma.stream, "count").mockResolvedValueOnce(0);
+    const filter = { ids: [1n, 3n], cursor: 5n, status: "streaming" as const };
+    await listStreams(filter, 100n);
+    await countStreams(filter, 100n);
+    const where = {
+      streamId: { in: [1n, 3n], lt: 5n },
+      cancelled: false,
+      startTime: { lte: 100n },
+      endTime: { gt: 100n },
+    };
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({ where }));
+    expect(count).toHaveBeenCalledWith({ where });
+  });
 });
 
