@@ -2,8 +2,6 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package*.json ./
-# npm ci runs the postinstall Prisma generator, which needs the schema.
-COPY prisma ./prisma
 RUN npm ci
 COPY . .
 RUN npx prisma generate && npm run build
