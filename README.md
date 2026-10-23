@@ -22,6 +22,9 @@ For guides and technical documentation, see the [Documentation Index](docs/READM
 - [Database schema](#database-schema)
 - [Glossary](#glossary)
 - [API](#api)
+  - [`?at=` — Historical vesting snapshots](#at--historical-vesting-snapshots)
+  - [`?points=` — Vesting schedule points](#points--vesting-schedule-points)
+  - [ETag and conditional requests](#etag-and-conditional-requests)
 - [Error Responses](#error-responses)
 - [Health Endpoint Semantics](#health-endpoint-semantics)
 - [Metrics](#metrics)
@@ -170,18 +173,16 @@ and why, see [docs/response-headers.md](docs/response-headers.md).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/` | Service index: name, version, and a list of endpoints. |
 | `GET` | `/health` | Liveness check. Returns 200 with the service version; performs no database read. |
 | `GET` | `/ready` | Readiness check. Verifies database connectivity and that the indexer has made progress; returns 503 when the database is unavailable or the indexer has not yet applied any events. |
 | `GET` | `/status` | Indexer progress against the chain. Response includes `Cache-Control: no-store` to prevent stale lag readings. |
 | `GET` | `/streams` | List streams. Query params: `sender`, `recipient`, `token`, `limit`, `offset`, `includeTotal`, `cancelled`, `cursor`. Address filters accept lowercase and padded spellings and are normalized before matching. `total` is only included when `includeTotal=true`; `cancelled` filters by cancellation status when given, and is omitted to return both. Repeating a parameter is rejected with `400` — see [Query parameters](#query-parameters). |
 | `GET` | `/streams/summary` | Aggregate counts and exact total amounts per status (`pending`, `streaming`, `completed`, `cancelled`). Useful for dashboard overview displays without fetching individual streams. Response is cached for 30 seconds. |
-| `GET` | `/streams/:id` | A single stream by id. Also available as `HEAD`. |
-| `GET` | `/streams/:id/events` | A single stream's indexed event history, in ascending chain order. Optional `kind` filter (`created`, `withdrawn`, `cancelled`). |
-| `GET` | `/streams/:id/schedule` | Evenly spaced vesting curve points for charting, with the cliff instant included. Optional `points` query param (2–100, default 50). |
-| `GET` | `/accounts/:address/summary` | Incoming and outgoing stream counts and amount totals for a single Stellar address. |
+| `GET` | `/streams/{id}` | A single stream by id. Also available as `HEAD`. Optional `?at=<unix seconds>` to compute derived figures at a specific point in time instead of now. Accepts 0 to uint64 max. Responds `304` to a matching `If-None-Match`. |
+| `GET` | `/streams/{id}/events` | A single stream's indexed event history, in ascending chain order. Optional `kind` filter (`created`, `withdrawn`, `cancelled`). |
+| `GET` | `/streams/{id}/schedule` | Evenly spaced vesting curve points for charting, with the cliff step included. Optional `?points=<2–100>` (default 50). May return fewer points than requested for very short streams (zero-duration). Responds `304` to a matching `If-None-Match`. |
+| `GET` | `/accounts/{address}/summary` | Incoming and outgoing stream counts and amount totals for a single Stellar address. |
 | `GET` | `/tokens` | Each distinct streamed token, with its stream count and total escrowed amount. |
-| `GET` | `/metrics` | Prometheus metrics. Set `METRICS_TOKEN` to require `Authorization: Bearer <token>`. |
 
 Each stream is returned with its stored fields plus derived `vested`,
 `withdrawable`, `locked`, `progress`, and `status` (`pending`, `streaming`,
@@ -278,6 +279,130 @@ parameter-pollution footgun. The same applies when the repeated values are
 identical, and when the second spelling is percent-encoded (for example
 `?sender=A&%73ender=B`). See
 [docs/query-parameters.md](docs/query-parameters.md) for the decision record.
+
+### `?at=` — Historical vesting snapshots
+
+`GET /streams/:id` accepts an optional `?at=<unix seconds>` query parameter. When supplied, all derived figures — `vested`, `withdrawable`, `locked`, `progress`, and `status` — are computed at that timestamp instead of the current wall-clock time. The stored fields (`totalAmount`, `withdrawn`, `startTime`, `endTime`, `cliffTime`, `cancelled`) are unchanged; only the time-dependent fields differ.
+
+**Accepted range:** any integer from `0` to `18446744073709551615` (uint64 max). Values outside this range, non-integer strings, and empty strings return `400 VALIDATION_ERROR`. There is no lower bound enforced by the server — passing a timestamp before the stream started simply returns `vested: "0"`.
+
+**Typical uses:**
+
+- Verifying what a recipient could have withdrawn at a past moment (e.g. a dispute over a cancelled stream).
+- Showing a historical chart point without pulling a full schedule.
+- Regression testing vesting math against known timestamps.
+
+```bash
+# What was vested at the start of 2025?
+curl -s "http://localhost:3000/streams/42?at=1735689600" | jq '.vested,.status'
+"0"
+"pending"
+
+# What is vested right now (default behaviour, no ?at)?
+curl -s "http://localhost:3000/streams/42" | jq '.vested,.status'
+"50000000000000"
+"streaming"
+
+# What will be vested after the stream has fully completed?
+curl -s "http://localhost:3000/streams/42?at=1767225600" | jq '.vested,.status'
+"100000000000000"
+"completed"
+```
+
+**ETag behaviour with `?at=`:** The `ETag` for a request with `?at=` is `"<updatedLedger>-<at>"`, distinct from the bare `"<updatedLedger>"` for the same stream without the parameter. This ensures that two requests for the same stream at different timestamps produce separate cache entries and that a stale `If-None-Match` from a plain request cannot match a timestamped one.
+
+### `?points=` — Vesting schedule points
+
+`GET /streams/:id/schedule` returns evenly spaced points along a stream's vesting curve, suitable for rendering a chart. The optional `?points=<n>` parameter controls how many sample points are returned.
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `points` | integer | 50 | 2–100 | Desired number of points in the returned curve. |
+
+Values below 2 are clamped up to 2; values above 100 are clamped down to 100. A non-integer or empty string returns `400 VALIDATION_ERROR`.
+
+**How points are distributed:**
+
+The endpoint spreads `points` timestamps evenly from `startTime` to `endTime`. For streams that have a cliff (`cliffTime` strictly between `startTime` and `endTime`), the cliff timestamp replaces the nearest interior sample so the vesting step is always visible regardless of the requested count.
+
+**Zero-duration streams:** When `startTime == endTime` the stream cannot be subdivided, so the endpoint returns a single point regardless of how many are requested. This is the only case where the response may contain fewer points than requested.
+
+```bash
+# Default: 50 evenly spaced points
+curl -s "http://localhost:3000/streams/42/schedule" | jq '.points | length'
+50
+
+# Minimal two-point curve (start and end only)
+curl -s "http://localhost:3000/streams/42/schedule?points=2" | jq
+{
+  "points": [
+    { "time": "1735689600", "amount": "0", "vested": "0" },
+    { "time": "1767225600", "amount": "100000000000000", "vested": "100000000000000" }
+  ]
+}
+
+# Three points — cliff replaces the nearest interior sample
+curl -s "http://localhost:3000/streams/42/schedule?points=3" | jq
+{
+  "points": [
+    { "time": "1735689600", "amount": "0", "vested": "0" },
+    { "time": "1740000000", "amount": "13668188736681", "vested": "13668188736681" },
+    { "time": "1767225600", "amount": "100000000000000", "vested": "100000000000000" }
+  ]
+}
+```
+
+Each point has three fields, all decimal strings:
+
+| Field | Description |
+|-------|-------------|
+| `time` | Unix timestamp in seconds for this sample. |
+| `amount` | Cumulative vested amount at this timestamp (token base units). |
+| `vested` | Same as `amount`; included for consistency with the stream view. |
+
+**Note:** The schedule is computed from the stored fields and the vesting formula — it does not vary with the current time. The `amount` at each point is what would be vested if a user queried the stream at exactly that second, not the amount vested as of now.
+
+### ETag and conditional requests
+
+`GET /streams/:id` and `GET /streams/:id/schedule` both set an `ETag` response header and honour the `If-None-Match` request header for conditional GET / HEAD requests.
+
+**How ETags are formed:**
+
+| Route | `ETag` value |
+|-------|-------------|
+| `GET /streams/:id` (no `?at=`) | `"<updatedLedger>"` |
+| `GET /streams/:id?at=<ts>` | `"<updatedLedger>-<ts>"` |
+| `GET /streams/:id/schedule?points=<n>` | `"<updatedLedger>-schedule-<n>"` |
+
+`updatedLedger` is the ledger sequence of the last event applied to that stream. It advances whenever a `Withdrawn` or `Cancelled` event is indexed for the stream, and never otherwise.
+
+**Revalidation flow:**
+
+```bash
+# First request — server returns 200 and the ETag
+curl -si http://localhost:3000/streams/42 | grep -E "HTTP|ETag"
+HTTP/1.1 200 OK
+ETag: "200"
+
+# Second request — send the ETag back; server returns 304 with no body
+curl -si -H 'If-None-Match: "200"' http://localhost:3000/streams/42 | grep "HTTP"
+HTTP/1.1 304 Not Modified
+
+# Same for the schedule route
+curl -si http://localhost:3000/streams/42/schedule?points=50 | grep -E "HTTP|ETag"
+HTTP/1.1 200 OK
+ETag: "200-schedule-50"
+
+curl -si -H 'If-None-Match: "200-schedule-50"' \
+  "http://localhost:3000/streams/42/schedule?points=50" | grep "HTTP"
+HTTP/1.1 304 Not Modified
+```
+
+**When a 304 is returned:** the server checks the incoming `If-None-Match` value against the ETag it would have produced for the current database state. If they match exactly the response body is omitted and `304 Not Modified` is returned, saving the round-trip data. A mismatched `If-None-Match` (or no header at all) always produces a full `200` response.
+
+**Caveat:** `?at=` and `?points=` are both encoded into the ETag, so changing either parameter on the same stream id produces a different ETag even when `updatedLedger` has not advanced. A client caching both `?at=1735689600` and the bare URL for stream 42 will hold two separate cache entries and must send the right `If-None-Match` for each request variant.
+
+**Error responses never carry an ETag.** The `ETag` header (and `Cache-Control`) is set only after the stream is found and validated. A `400 VALIDATION_ERROR` or `404 NOT_FOUND` response carries neither header.
 
 ### Example Requests
 
