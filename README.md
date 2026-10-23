@@ -188,6 +188,87 @@ Each stream is returned with its stored fields plus derived `vested`,
 `completed`, or `cancelled`). `progress` is vesting progress in basis points
 (0–10000).
 
+### Pagination Parameters
+
+The `GET /streams` endpoint supports pagination through the following query parameters:
+
+| Parameter | Type | Default | Maximum | Description |
+|-----------|------|---------|---------|-------------|
+| `limit` | integer | 50 | 100 | Maximum number of streams to return per page |
+| `offset` | integer | 0 | 10,000 | Zero-based index of the first stream to return |
+| `cursor` | string | - | - | Opaque cursor from a previous response for stable pagination |
+| `includeTotal` | boolean | false | - | When `true`, includes the total count of matching streams |
+
+**Note:** When `cursor` is provided, `offset` is ignored and offset ceiling checks are skipped. Use cursor-based pagination for stable results under concurrent inserts.
+
+**Revalidation:** `GET /streams` responses carry a weak `ETag` derived from the response body. Send it back in an `If-None-Match` header to receive `304 Not Modified` with no body when nothing changed, saving bandwidth on repeat polls. The `ETag` changes whenever any returned field changes (streams, `total`, `nextCursor`, or pagination).
+
+#### offset vs. cursor: why the results can differ
+
+`offset` pages by position — "skip N rows, then take the next `limit`" —
+against a list ordered by stream id descending (newest first; see the
+`/streams` endpoint description above for the full ordering rule when an
+address filter is applied). That position shifts under you if a row is
+inserted or removed between requests, because the set of rows that exists
+"before" a given position has changed.
+
+Concretely: with streams `101`–`105` already indexed, a client fetches
+`?limit=2&offset=0` and gets `[105, 104]` (newest first). Before it asks for
+the next page, stream `106` is indexed. The client then fetches
+`?limit=2&offset=2`, expecting to continue with `[103, 102]`, but `106` is
+now the newest row and has pushed everything down by one position: position 2
+is stream `104` again. The response is `[104, 103]` — **`104` is returned
+twice, and `106` is never returned at all**, because the client had already
+moved past the position it would have appeared in. A deletion between
+requests has the opposite effect: everything shifts up by one, and a row gets
+skipped instead of repeated.
+
+`cursor` pages by value instead of position: the response's `nextCursor`
+encodes the id of the last stream already returned, and the next request
+asks for rows strictly before that id (`streamId < cursor`, same descending
+order). A newly inserted stream gets a newer id than anything already paged
+past, so it never falls inside a window that has already been returned, and a
+cancelled or otherwise-unchanged stream never moves relative to the cursor.
+Pagination is therefore stable under concurrent inserts, at the cost of not
+being able to jump to an arbitrary page — only "next."
+
+**Prefer `cursor` whenever you are paging through more than one page of
+results**, especially for a backfill, export, or anything long-running enough
+for the table to change underneath it. `offset` is fine for a single page, or
+for jumping to a known position (e.g. a UI page number) where occasionally
+seeing a duplicate or missing row at the boundary is acceptable.
+
+#### Why offset is capped at 10,000
+
+An `offset` that large forces Postgres to scan and discard that many rows
+before it can return the page, which gets slow as the offset grows — exactly
+the kind of scan a client doing bulk pagination should not be doing anyway.
+Requests with `offset` over 10,000 are rejected with `400 VALIDATION_ERROR`
+instead of being served slowly; `cursor`-based pagination has no such ceiling
+because it is a keyset lookup (`streamId < cursor`) that stays fast regardless
+of how many pages precede it.
+
+#### Following `nextCursor` to fetch every page
+
+```ts
+let cursor: string | undefined;
+const allStreams = [];
+
+do {
+  const url = new URL("http://localhost:3000/streams");
+  url.searchParams.set("limit", "100");
+  if (cursor) url.searchParams.set("cursor", cursor);
+
+  const page = await fetch(url).then((r) => r.json());
+  allStreams.push(...page.streams);
+  cursor = page.nextCursor; // undefined once the last page is reached
+} while (cursor);
+```
+
+`nextCursor` is present only when another page follows; its absence from the
+response is the end-of-results signal, not an empty `streams` array (the last
+page can still hold up to `limit` rows).
+
 ### Query parameters
 
 Filter parameters are single-valued. Repeating one — `?sender=A&sender=B` — is
@@ -421,92 +502,6 @@ curl -s http://localhost:3000/metrics
 # TYPE tricklepay_indexer_lag_ledgers gauge
 tricklepay_indexer_lag_ledgers 709986
 ```
-
-### Pagination Parameters
-
-The `GET /streams` endpoint supports pagination through the following query parameters:
-
-| Parameter | Type | Default | Maximum | Description |
-|-----------|------|---------|---------|-------------|
-| `limit` | integer | 50 | 100 | Maximum number of streams to return per page |
-| `offset` | integer | 0 | 10,000 | Zero-based index of the first stream to return |
-| `cursor` | string | - | - | Opaque cursor from a previous response for stable pagination |
-| `includeTotal` | boolean | false | - | When `true`, includes the total count of matching streams |
-
-**Note:** When `cursor` is provided, `offset` is ignored and offset ceiling checks are skipped. Use cursor-based pagination for stable results under concurrent inserts.
-
-**Revalidation:** `GET /streams` responses carry a weak `ETag` derived from the response body. Send it back in an `If-None-Match` header to receive `304 Not Modified` with no body when nothing changed, saving bandwidth on repeat polls. The `ETag` changes whenever any returned field changes (streams, `total`, `nextCursor`, or pagination).
-| `GET` | `/streams/summary` | Aggregate counts and exact total amounts per status (`pending`, `streaming`, `completed`, `cancelled`). Useful for dashboard overview displays without fetching individual streams. Response is cached for 30 seconds. |
-| `GET` | `/streams/:id` | A single stream by id. |
-| `GET` | `/metrics` | Prometheus metrics. Set `METRICS_TOKEN` to require `Authorization: Bearer <token>`. |
-When `cursor` is provided, `offset` is ignored and the offset ceiling check
-below is skipped.
-
-#### offset vs. cursor: why the results can differ
-
-`offset` pages by position — "skip N rows, then take the next `limit`" —
-against a list ordered by stream id descending (newest first; see the
-`/streams` endpoint description above for the full ordering rule when an
-address filter is applied). That position shifts under you if a row is
-inserted or removed between requests, because the set of rows that exists
-"before" a given position has changed.
-
-Concretely: with streams `101`–`105` already indexed, a client fetches
-`?limit=2&offset=0` and gets `[105, 104]` (newest first). Before it asks for
-the next page, stream `106` is indexed. The client then fetches
-`?limit=2&offset=2`, expecting to continue with `[103, 102]`, but `106` is
-now the newest row and has pushed everything down by one position: position 2
-is stream `104` again. The response is `[104, 103]` — **`104` is returned
-twice, and `106` is never returned at all**, because the client had already
-moved past the position it would have appeared in. A deletion between
-requests has the opposite effect: everything shifts up by one, and a row gets
-skipped instead of repeated.
-
-`cursor` pages by value instead of position: the response's `nextCursor`
-encodes the id of the last stream already returned, and the next request
-asks for rows strictly before that id (`streamId < cursor`, same descending
-order). A newly inserted stream gets a newer id than anything already paged
-past, so it never falls inside a window that has already been returned, and a
-cancelled or otherwise-unchanged stream never moves relative to the cursor.
-Pagination is therefore stable under concurrent inserts, at the cost of not
-being able to jump to an arbitrary page — only "next."
-
-**Prefer `cursor` whenever you are paging through more than one page of
-results**, especially for a backfill, export, or anything long-running enough
-for the table to change underneath it. `offset` is fine for a single page, or
-for jumping to a known position (e.g. a UI page number) where occasionally
-seeing a duplicate or missing row at the boundary is acceptable.
-
-#### Why offset is capped at 10,000
-
-An `offset` that large forces Postgres to scan and discard that many rows
-before it can return the page, which gets slow as the offset grows — exactly
-the kind of scan a client doing bulk pagination should not be doing anyway.
-Requests with `offset` over 10,000 are rejected with `400 VALIDATION_ERROR`
-instead of being served slowly; `cursor`-based pagination has no such ceiling
-because it is a keyset lookup (`streamId < cursor`) that stays fast regardless
-of how many pages precede it.
-
-#### Following `nextCursor` to fetch every page
-
-```ts
-let cursor: string | undefined;
-const allStreams = [];
-
-do {
-  const url = new URL("http://localhost:3000/streams");
-  url.searchParams.set("limit", "100");
-  if (cursor) url.searchParams.set("cursor", cursor);
-
-  const page = await fetch(url).then((r) => r.json());
-  allStreams.push(...page.streams);
-  cursor = page.nextCursor; // undefined once the last page is reached
-} while (cursor);
-```
-
-`nextCursor` is present only when another page follows; its absence from the
-response is the end-of-results signal, not an empty `streams` array (the last
-page can still hold up to `limit` rows).
 
 ### Stream Summary Endpoint
 
