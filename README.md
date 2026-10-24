@@ -173,15 +173,17 @@ and why, see [docs/response-headers.md](docs/response-headers.md).
 
 | Method | Path | Description |
 | --- | --- | --- |
+| `GET` | `/` | Service index: `name`, `description`, `network`, `contractId`, and a list of endpoints. Performs no database read. |
 | `GET` | `/health` | Liveness check. Returns 200 with the service version; performs no database read. |
-| `GET` | `/ready` | Readiness check. Verifies database connectivity and that the indexer has made progress; returns 503 when the database is unavailable or the indexer has not yet applied any events. |
+| `GET` | `/ready` | Readiness check. Verifies database connectivity and that the indexer has made progress — its stored `lastLedger` must be greater than 0, meaning a ledger has been processed (no event needs to have been applied). Returns 503 with a `Retry-After` header when the database is unavailable or the indexer has not yet processed a ledger. |
 | `GET` | `/status` | Indexer progress against the chain. Response includes `Cache-Control: no-store` to prevent stale lag readings. |
 | `GET` | `/streams` | List streams. Query params: `sender`, `recipient`, `token`, `limit`, `offset`, `includeTotal`, `cancelled`, `cursor`. Address filters accept lowercase and padded spellings and are normalized before matching. `total` is only included when `includeTotal=true`; `cancelled` filters by cancellation status when given, and is omitted to return both. Repeating a parameter is rejected with `400` — see [Query parameters](#query-parameters). |
-| `GET` | `/streams/summary` | Aggregate counts and exact total amounts per status (`pending`, `streaming`, `completed`, `cancelled`). Useful for dashboard overview displays without fetching individual streams. Response is cached for 30 seconds. |
+| `GET` | `/streams/summary` | Aggregate counts and exact total amounts per status (`pending`, `streaming`, `completed`, `cancelled`). Useful for dashboard overview displays without fetching individual streams. The response is cached in-process for the window set by `STREAM_SUMMARY_CACHE_TTL_MS` (2 seconds by default) — see [Stream Summary Endpoint](#stream-summary-endpoint) for the cache headers. |
 | `GET` | `/streams/{id}` | A single stream by id. Also available as `HEAD`. Optional `?at=<unix seconds>` to compute derived figures at a specific point in time instead of now. Accepts 0 to uint64 max. Responds `304` to a matching `If-None-Match`. |
 | `GET` | `/streams/{id}/events` | A single stream's indexed event history, in ascending chain order. Optional `kind` filter (`created`, `withdrawn`, `cancelled`). |
 | `GET` | `/streams/{id}/schedule` | Evenly spaced vesting curve points for charting, with the cliff step included. Optional `?points=<2–100>` (default 50). May return fewer points than requested for very short streams (zero-duration). Responds `304` to a matching `If-None-Match`. |
 | `GET` | `/accounts/{address}/summary` | Incoming and outgoing stream counts and amount totals for a single Stellar address. |
+| `GET` | `/tokens` | Each distinct streamed token, with its stream count and total escrowed amount. |
 | `GET` | `/tokens` | Each distinct streamed token, with its stream count and total escrowed amount. |
 
 Each stream is returned with its stored fields plus derived `vested`,
@@ -628,6 +630,88 @@ curl -s http://localhost:3000/metrics
 tricklepay_indexer_lag_ledgers 709986
 ```
 
+### Pagination Parameters
+
+The `GET /streams` endpoint supports pagination through the following query parameters:
+
+| Parameter | Type | Default | Maximum | Description |
+|-----------|------|---------|---------|-------------|
+| `limit` | integer | 50 | 100 | Maximum number of streams to return per page |
+| `offset` | integer | 0 | 10,000 | Zero-based index of the first stream to return |
+| `cursor` | string | - | - | Opaque cursor from a previous response for stable pagination |
+| `includeTotal` | boolean | false | - | When `true`, includes the total count of matching streams |
+
+**Note:** When `cursor` is provided, `offset` is ignored and offset ceiling checks are skipped. Use cursor-based pagination for stable results under concurrent inserts.
+
+**Revalidation:** `GET /streams` responses carry a weak `ETag` derived from the response body. Send it back in an `If-None-Match` header to receive `304 Not Modified` with no body when nothing changed, saving bandwidth on repeat polls. The `ETag` changes whenever any returned field changes (streams, `total`, `nextCursor`, or pagination).
+When `cursor` is provided, `offset` is ignored and the offset ceiling check
+below is skipped.
+
+#### offset vs. cursor: why the results can differ
+
+`offset` pages by position — "skip N rows, then take the next `limit`" —
+against a list ordered by stream id descending (newest first; see the
+`/streams` endpoint description above for the full ordering rule when an
+address filter is applied). That position shifts under you if a row is
+inserted or removed between requests, because the set of rows that exists
+"before" a given position has changed.
+
+Concretely: with streams `101`–`105` already indexed, a client fetches
+`?limit=2&offset=0` and gets `[105, 104]` (newest first). Before it asks for
+the next page, stream `106` is indexed. The client then fetches
+`?limit=2&offset=2`, expecting to continue with `[103, 102]`, but `106` is
+now the newest row and has pushed everything down by one position: position 2
+is stream `104` again. The response is `[104, 103]` — **`104` is returned
+twice, and `106` is never returned at all**, because the client had already
+moved past the position it would have appeared in. A deletion between
+requests has the opposite effect: everything shifts up by one, and a row gets
+skipped instead of repeated.
+
+`cursor` pages by value instead of position: the response's `nextCursor`
+encodes the id of the last stream already returned, and the next request
+asks for rows strictly before that id (`streamId < cursor`, same descending
+order). A newly inserted stream gets a newer id than anything already paged
+past, so it never falls inside a window that has already been returned, and a
+cancelled or otherwise-unchanged stream never moves relative to the cursor.
+Pagination is therefore stable under concurrent inserts, at the cost of not
+being able to jump to an arbitrary page — only "next."
+
+**Prefer `cursor` whenever you are paging through more than one page of
+results**, especially for a backfill, export, or anything long-running enough
+for the table to change underneath it. `offset` is fine for a single page, or
+for jumping to a known position (e.g. a UI page number) where occasionally
+seeing a duplicate or missing row at the boundary is acceptable.
+
+#### Why offset is capped at 10,000
+
+An `offset` that large forces Postgres to scan and discard that many rows
+before it can return the page, which gets slow as the offset grows — exactly
+the kind of scan a client doing bulk pagination should not be doing anyway.
+Requests with `offset` over 10,000 are rejected with `400 VALIDATION_ERROR`
+instead of being served slowly; `cursor`-based pagination has no such ceiling
+because it is a keyset lookup (`streamId < cursor`) that stays fast regardless
+of how many pages precede it.
+
+#### Following `nextCursor` to fetch every page
+
+```ts
+let cursor: string | undefined;
+const allStreams = [];
+
+do {
+  const url = new URL("http://localhost:3000/streams");
+  url.searchParams.set("limit", "100");
+  if (cursor) url.searchParams.set("cursor", cursor);
+
+  const page = await fetch(url).then((r) => r.json());
+  allStreams.push(...page.streams);
+  cursor = page.nextCursor; // undefined once the last page is reached
+} while (cursor);
+```
+
+`nextCursor` is present only when another page follows; its absence from the
+response is the end-of-results signal, not an empty `streams` array (the last
+page can still hold up to `limit` rows).
 ### Stream Summary Endpoint
 
 The `/streams/summary` endpoint returns aggregate counts and exact total amounts grouped by lifecycle status. It is designed for dashboard overview displays where individual stream details are not needed.
@@ -647,7 +731,7 @@ The `/streams/summary` endpoint returns aggregate counts and exact total amounts
 }
 ```
 
-All amounts are exact integer base units encoded as strings (not JSON numbers) to preserve full 128-bit precision. The response is held in-process for the window set by `STREAM_SUMMARY_CACHE_TTL_MS` (2 seconds by default, `0` to disable); `Cache-Control: public, max-age=N` reports the seconds left in that window, so `N` counts down as the cached entry ages — the full window immediately after a fresh computation, `0` at the end of it — and a client's copy never outlives the server's.
+All amounts are exact integer base units encoded as strings (not JSON numbers) to preserve full 128-bit precision. The response is held in-process for the window set by `STREAM_SUMMARY_CACHE_TTL_MS` (`0` disables caching); `Cache-Control: public, max-age=N` reports the seconds left in that window, so `N` counts down as the cached entry ages — the full window immediately after a fresh computation, `0` at the end of it — and a client's copy never outlives the server's.
 
 **Data Types and Precision**
 - **Amounts** (`totalAmount`, `withdrawn`, `vested`, `withdrawable`, `locked`) are returned as strings holding integer base units.
@@ -748,11 +832,14 @@ performs no database read, so it stays green even when dependencies are down.
 `/ready` is a readiness probe and reflects whether the service has usable
 data, not merely whether dependencies answer. It verifies database
 connectivity and that the indexer has made progress — specifically, that
-`IndexerState.lastLedger` has advanced past its initial value, meaning at
-least one event has been applied to Postgres. A freshly started instance that
-has not yet indexed anything returns 503, so traffic is not routed to an
-instance that would serve an empty list. Liveness is unaffected: `/health`
-continues to return 200 regardless of indexer progress.
+`IndexerState.lastLedger` is greater than 0, meaning the indexer has
+processed at least one ledger. That is a statement about ledgers, not
+events: the first successful poll records a position even when it finds no
+events, so an instance on a quiet chain becomes ready once that first poll
+has succeeded. An instance whose position is still missing, or still at 0,
+returns 503, so traffic is not routed to an instance that would serve an
+empty list. Liveness is unaffected: `/health` continues to return 200
+regardless of indexer progress.
 
 The service exposes two health endpoints that answer different questions. Wire them to separate probes in your orchestration platform.
 
@@ -780,7 +867,7 @@ The service exposes two health endpoints that answer different questions. Wire t
 
 **What it checks:**
 1. Database connectivity (can reach Postgres)
-2. Indexer lag (how far behind the chain)
+2. Indexer progress (`IndexerState.lastLedger` is greater than 0)
 
 **What it does NOT check:**
 - Chain connectivity
@@ -797,12 +884,21 @@ The service exposes two health endpoints that answer different questions. Wire t
 }
 ```
 
-**Response (unhealthy):**
+**Response (unhealthy — database down):**
 ```json
 {
   "status": "not_ready",
   "database": "down",
   "error": "Connection refused"
+}
+```
+
+**Response (unhealthy — indexer has not made progress):**
+```json
+{
+  "status": "not_ready",
+  "database": "up",
+  "error": "indexer has not made progress"
 }
 ```
 
@@ -815,7 +911,7 @@ Every 503 response also carries a `Retry-After` header whose value is the number
 | Probe | Fires When | Action |
 |-------|------------|--------|
 | Liveness (`/health`) | Process is unresponsive | Restart container |
-| Readiness (`/ready`) | Database unreachable | Remove from rotation, do not restart |
+| Readiness (`/ready`) | Database unreachable, or the indexer has not yet processed a ledger | Remove from rotation, do not restart |
 
 ## Metrics
 
@@ -1401,13 +1497,15 @@ they answer different questions:
   soon as the process is up and performs no database read. A liveness probe
   should restart the container if this stops responding — it means the process
   itself is wedged.
-- **Readiness — `GET /ready`.** Checks the database connection and returns
-  `200` with the current indexer lag when it succeeds, or
-  `503 {"status":"not_ready","database":"down"}` when Postgres is unreachable.
-  The 503 carries a `Retry-After` header (seconds, configurable via
-  `READINESS_RETRY_AFTER_SECONDS`) so probes can pace themselves; a 200 does
-  not. A readiness probe should take the instance out of load-balancer rotation
-  on a 503 without restarting it — the process is fine, a dependency isn't.
+- **Readiness — `GET /ready`.** Checks the database connection and that the
+  indexer has processed at least one ledger, then returns `200` with the
+  current indexer lag when it succeeds, `503 {"status":"not_ready","database":"down"}`
+  when Postgres is unreachable, or `503 {"status":"not_ready","database":"up"}`
+  when the indexer has not yet processed a ledger. The 503 carries a `Retry-After`
+  header (seconds, configurable via `READINESS_RETRY_AFTER_SECONDS`) so probes
+  can pace themselves; a 200 does not. A readiness probe should take the
+  instance out of load-balancer rotation on a 503 without restarting it — the
+  process is fine, a dependency isn't.
 
 ### Migrations
 
