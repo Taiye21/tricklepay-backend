@@ -96,6 +96,17 @@ describe("GET /docs/json (OpenAPI spec)", () => {
     expect(paths).toHaveProperty("/streams/{id}");
   });
 
+  it("documents the ids query filter and its limit", async () => {
+    const spec = await getSpec();
+    const paths = spec.paths as Record<string, {
+      get: { parameters: { name: string; in: string; schema: { type: string }; description?: string }[] };
+    }>;
+    const ids = paths["/streams"].get.parameters.find((parameter) => parameter.name === "ids");
+    expect(ids).toMatchObject({ name: "ids", in: "query", schema: { type: "string" } });
+    expect(ids?.description).toContain("100");
+    expect(ids?.description).toContain("Unknown ids are omitted");
+  });
+
   it("documents the GET /streams/summary path", async () => {
     const spec = await getSpec();
     const paths = spec.paths as Record<string, unknown>;
