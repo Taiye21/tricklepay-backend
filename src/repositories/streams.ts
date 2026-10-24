@@ -78,6 +78,8 @@ export interface StreamFilter {
   cursor?: bigint;
   limit?: number;
   offset?: number;
+  minAmount?: bigint;
+  maxAmount?: bigint;
 }
 
 export interface StreamListResult {

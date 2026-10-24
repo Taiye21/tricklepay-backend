@@ -340,6 +340,16 @@ export async function streamRoutes(
                 "Opaque cursor returned by a previous list response. Use this to fetch the next page " +
                 "with stable ordering under concurrent inserts. Takes precedence over offset when both are provided.",
             },
+            minAmount: {
+              type: "string",
+              description: "Filter streams with total amount greater than or equal to this value (non-negative integer string).",
+              examples: ["1000000"],
+            },
+            maxAmount: {
+              type: "string",
+              description: "Filter streams with total amount less than or equal to this value (non-negative integer string).",
+              examples: ["10000000"],
+            },
           },
           additionalProperties: false,
         },
@@ -384,6 +394,8 @@ export async function streamRoutes(
         cancelled?: boolean;
         status?: "pending" | "streaming" | "completed" | "cancelled";
         cursor?: bigint;
+        minAmount?: bigint;
+        maxAmount?: bigint;
       } = {};
       if (query.ids !== undefined) {
         const parts = query.ids.split(",");
@@ -422,6 +434,19 @@ export async function streamRoutes(
       }
 
       filter.cursor = cursor;
+      
+      // Parse amount filters
+      const minAmount = parseAmount(query.minAmount);
+      if (query.minAmount !== undefined && minAmount === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid minAmount (must be non-negative integer)");
+      }
+      filter.minAmount = minAmount ?? undefined;
+      
+      const maxAmount = parseAmount(query.maxAmount);
+      if (query.maxAmount !== undefined && maxAmount === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid maxAmount (must be non-negative integer)");
+      }
+      filter.maxAmount = maxAmount ?? undefined;
 
       const includeTotal = parseIncludeTotal(query.includeTotal);
 
