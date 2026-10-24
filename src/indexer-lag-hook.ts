@@ -44,15 +44,19 @@ export function registerIndexerLagHook(app: FastifyInstance): void {
     if (request.method !== "GET") return;
 
     // Skip health check and metrics endpoints
-    if (request.url.startsWith("/health") || 
-        request.url.startsWith("/ready") || 
+    if (request.url.startsWith("/health") ||
+        request.url.startsWith("/ready") ||
         request.url === "/metrics") {
       return;
     }
 
-    const lag = await getLag();
-    if (lag !== null) {
-      reply.header("X-Indexer-Lag-Ledgers", lag.toString());
+    try {
+      const lag = await getLag();
+      if (lag !== null) {
+        reply.header("X-Indexer-Lag-Ledgers", lag.toString());
+      }
+    } catch (err) {
+      request.log.debug({ err }, "could not read indexer lag");
     }
   });
 }

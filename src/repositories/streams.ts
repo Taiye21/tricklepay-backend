@@ -69,6 +69,7 @@ export interface CancellationInput {
 export type ApplyResult = "applied" | "duplicate" | "missing";
 
 export interface StreamFilter {
+  ids?: bigint[];
   sender?: string;
   recipient?: string;
   token?: string;
@@ -77,6 +78,8 @@ export interface StreamFilter {
   cursor?: bigint;
   limit?: number;
   offset?: number;
+  minAmount?: bigint;
+  maxAmount?: bigint;
 }
 
 export interface StreamListResult {
@@ -287,14 +290,21 @@ function whereFromFilter(filter: StreamFilter, now?: bigint): Prisma.StreamWhere
   if (filter.recipient) where.recipient = filter.recipient;
   if (filter.token) where.token = filter.token;
   if (filter.cancelled !== undefined) where.cancelled = filter.cancelled;
-  if (filter.cursor !== undefined) where.streamId = { lt: filter.cursor };
-  
+  if (filter.ids !== undefined || filter.cursor !== undefined) {
+    where.streamId = {
+      // PostgreSQL BIGINT cannot store the upper half of uint64. Those valid
+      // contract ids cannot match a row, so omit them before binding parameters.
+      ...(filter.ids === undefined ? {} : { in: filter.ids.filter((id) => id <= 9223372036854775807n) }),
+      ...(filter.cursor === undefined ? {} : { lt: filter.cursor }),
+    };
+  }
+
   // Apply status filter using the same predicates as the summary endpoint
   if (filter.status && now !== undefined) {
     const statusFilter = statusWhereFilter(filter.status, now);
     Object.assign(where, statusFilter);
   }
-  
+
   return where;
 }
 
@@ -327,7 +337,7 @@ export function statusWhere(status: StreamStatus, now: bigint): Prisma.StreamWhe
   }
 }
 
-export async function listStreams(filter: StreamFilter): Promise<StreamListResult> {
+export async function listStreams(filter: StreamFilter, now?: bigint): Promise<StreamListResult> {
   const limit = filter.limit ?? 50;
   const useCursor = filter.cursor !== undefined;
   const take = limit + 1;

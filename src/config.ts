@@ -4,7 +4,7 @@
 
 import { StrKey } from "@stellar/stellar-sdk";
 
-import { parseTrustedProxies } from "./proxy.js";
+import { parseTrustedProxies, parseAllowlist } from "./proxy.js";
 
 try {
   process.loadEnvFile();
@@ -75,11 +75,19 @@ export const DEFAULT_MAX_PAGES_PER_TICK = 1000;
 // Summary aggregates are expensive and commonly polled, so cache them briefly.
 export const DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS = 2_000;
 
+// Default maximum allowed staleness for the indexer position reported by /ready.
+// 0 means disabled (no staleness check).
+export const DEFAULT_READY_MAX_STALENESS_MS = 0;
+
 // Default request rate limit: 100 requests per client IP per 60-second
 // window, matching docs/request-size-limits.md. Used by loadConfig below and
 // by server.ts when registering the rate-limit plugin.
 export const DEFAULT_RATE_LIMIT_MAX = 100;
 export const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+
+export const DEFAULT_CONNECTION_TIMEOUT_MS = 10_000;
+export const DEFAULT_KEEP_ALIVE_TIMEOUT_MS = 72_000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 // Default Retry-After, in seconds, advertised on a not-ready `/ready`
 // response. It tells orchestrators and load balancers how long to wait before
@@ -140,7 +148,7 @@ function validateRpcUrl(url: string): void {
   if (url.startsWith("http://") && !isLocalUrl(url)) {
     throw new Error(
       `SOROBAN_RPC_URL "${url}" uses plain HTTP on a non-local host. ` +
-        `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
+      `Remote endpoints must use HTTPS. Use http:// only for localhost, 127.x.x.x or [::1].`,
     );
   }
 }
@@ -153,7 +161,7 @@ function validateContractId(contractId: string): void {
   if (!StrKey.isValidContract(contractId)) {
     throw new Error(
       `STREAM_CONTRACT_ID "${contractId}" is not a valid Soroban contract address. ` +
-        `Expected a 56-character StrKey contract id starting with "C".`,
+      `Expected a 56-character StrKey contract id starting with "C".`,
     );
   }
 }
@@ -204,7 +212,7 @@ export function validateStartLedger(startLedger: number, chainHead: number): voi
   if (startLedger > chainHead) {
     throw new Error(
       `INDEXER_START_LEDGER ${startLedger} is beyond the chain head ${chainHead}. ` +
-        `The indexer would wait forever with no events. Set INDEXER_START_LEDGER to ${chainHead} or lower.`,
+      `The indexer would wait forever with no events. Set INDEXER_START_LEDGER to ${chainHead} or lower.`,
     );
   }
 }
@@ -238,9 +246,14 @@ export interface Config {
   readonly bodyLimit: number;
   readonly queryStringLimit: number;
   readonly compressionThresholdBytes: number;
+  readonly connectionTimeoutMs?: number;
+  readonly keepAliveTimeoutMs?: number;
+  readonly requestTimeoutMs?: number;
   readonly trustedProxies: readonly string[];
   readonly rateLimitMax?: number;
   readonly rateLimitWindowMs?: number;
+  readonly readyMaxStalenessMs: number;
+  readonly rateLimitAllowlist: readonly string[];
   readonly maxTrackedRateLimitClients?: number;
   readonly readinessRetryAfterSeconds: number;
   // Optional bearer token for the metrics endpoint. When set, /metrics requires
@@ -310,6 +323,9 @@ export function loadConfig(): Config {
     ),
     bodyLimit: integer("BODY_LIMIT", 1048576), // 1MB default
     queryStringLimit: integer("QUERY_STRING_LIMIT", 2048), // 2KB default
+    connectionTimeoutMs: integer("CONNECTION_TIMEOUT_MS", DEFAULT_CONNECTION_TIMEOUT_MS),
+    keepAliveTimeoutMs: integer("KEEP_ALIVE_TIMEOUT_MS", DEFAULT_KEEP_ALIVE_TIMEOUT_MS),
+    requestTimeoutMs: integer("REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS),
     compressionThresholdBytes: integer(
       "COMPRESSION_THRESHOLD_BYTES",
       DEFAULT_COMPRESSION_THRESHOLD_BYTES,
@@ -318,6 +334,10 @@ export function loadConfig(): Config {
     trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
     rateLimitMax,
     rateLimitWindowMs,
+    // Staleness threshold for the /ready endpoint. 0 = disabled.
+    readyMaxStalenessMs: integer("READY_MAX_STALENESS_MS", DEFAULT_READY_MAX_STALENESS_MS),
+    // Addresses that bypass the rate limiter entirely (#allowlist).
+    rateLimitAllowlist: parseAllowlist(process.env.RATE_LIMIT_ALLOWLIST),
     readinessRetryAfterSeconds,
     // An empty value means "no token", preserving the unauthenticated default.
     metricsToken: process.env.METRICS_TOKEN?.trim() || undefined,
@@ -381,6 +401,9 @@ export type LoggedConfig = {
 export function describeConfig(config: Config): LoggedConfig {
   return {
     port: config.port,
+    connectionTimeoutMs: config.connectionTimeoutMs,
+    keepAliveTimeoutMs: config.keepAliveTimeoutMs,
+    requestTimeoutMs: config.requestTimeoutMs,
     host: config.host,
     publicBaseUrl: config.publicBaseUrl,
     // The only field carrying a secret.
@@ -401,6 +424,9 @@ export function describeConfig(config: Config): LoggedConfig {
     // Undefined when rate limiting is not configured; pino omits the field.
     rateLimitMax: config.rateLimitMax,
     rateLimitWindowMs: config.rateLimitWindowMs,
+    readyMaxStalenessMs: config.readyMaxStalenessMs,
+    rateLimitAllowlist: config.rateLimitAllowlist,
+    maxTrackedRateLimitClients: config.maxTrackedRateLimitClients,
     // Never log the secret itself, only whether one is configured.
     metricsToken: config.metricsToken ? "[redacted]" : undefined,
     enableDocsUi: config.enableDocsUi,

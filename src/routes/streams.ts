@@ -203,6 +203,7 @@ export type StreamRoutesOptions = {
 // field, so a parameter renamed in one place without the other is a compile
 // error instead of a silently-undefined value at runtime.
 interface ListStreamsQuery {
+  ids?: string;
   sender?: string;
   recipient?: string;
   token?: string;
@@ -210,6 +211,7 @@ interface ListStreamsQuery {
   offset?: string;
   includeTotal?: string;
   cancelled?: string;
+  status?: StreamStatus;
   cursor?: string;
 }
 
@@ -219,6 +221,11 @@ export async function streamRoutes(
 ): Promise<void> {
   const summaryCacheTtlMs = opts.summaryCacheTtlMs ?? DEFAULT_STREAM_SUMMARY_CACHE_TTL_MS;
   let cachedSummary: { payload: SummaryPayload; createdAt: number } | null = null;
+  // When a recomputation is already in-flight, all concurrent callers wait on
+  // the same Promise instead of each running their own four aggregate queries.
+  // A failed computation is never stored; the waiting callers all receive the
+  // same rejection so no stale data leaks through.
+  let inFlightSummary: Promise<SummaryPayload> | null = null;
 
   // Ensure the shared schemas are available whether this plugin is registered
   // on a full server (which calls addSchema centrally) or a bare Fastify
@@ -257,6 +264,7 @@ export async function streamRoutes(
         summary: "List streams",
         description:
           "Returns a paginated list of token streams. Optionally filter by sender, recipient, or token address; " +
+          "ids accepts up to 100 comma-separated uint64 stream ids; unknown ids are omitted. " +
           "address filters accept lowercase and whitespace-padded spellings and are normalized before matching. " +
           "Use the opaque cursor returned by previous responses for stable pagination under concurrent inserts; " +
           "when cursor is provided, offset is ignored and offset ceiling checks are skipped. " +
@@ -269,6 +277,14 @@ export async function streamRoutes(
         querystring: {
           type: "object",
           properties: {
+            ids: {
+              type: "string",
+              description:
+                "Comma-separated uint64 stream ids (1 to 100 entries). Invalid ids or more than 100 entries return 400. " +
+                "Unknown ids are omitted and duplicates return one stream. Other filters and pagination still apply; " +
+                "use limit=100 to retrieve up to 100 matches in one page.",
+              examples: ["1,2,3"],
+            },
             sender: {
               type: "string",
               description:
@@ -324,6 +340,16 @@ export async function streamRoutes(
                 "Opaque cursor returned by a previous list response. Use this to fetch the next page " +
                 "with stable ordering under concurrent inserts. Takes precedence over offset when both are provided.",
             },
+            minAmount: {
+              type: "string",
+              description: "Filter streams with total amount greater than or equal to this value (non-negative integer string).",
+              examples: ["1000000"],
+            },
+            maxAmount: {
+              type: "string",
+              description: "Filter streams with total amount less than or equal to this value (non-negative integer string).",
+              examples: ["10000000"],
+            },
           },
           additionalProperties: false,
         },
@@ -361,13 +387,31 @@ export async function streamRoutes(
       }
 
       const filter: {
+        ids?: bigint[];
         sender?: string;
         recipient?: string;
         token?: string;
         cancelled?: boolean;
         status?: "pending" | "streaming" | "completed" | "cancelled";
         cursor?: bigint;
+        minAmount?: bigint;
+        maxAmount?: bigint;
       } = {};
+      if (query.ids !== undefined) {
+        const parts = query.ids.split(",");
+        if (parts.length > 100) {
+          return sendError(reply, request, 400, "VALIDATION_ERROR", "ids must contain at most 100 stream ids");
+        }
+        const ids: bigint[] = [];
+        for (const part of parts) {
+          const id = parseStreamId(part);
+          if (id === null) {
+            return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid stream id in ids");
+          }
+          ids.push(id);
+        }
+        filter.ids = [...new Set(ids)];
+      }
       for (const field of ["sender", "recipient", "token"] as const) {
         const raw = query[field];
         if (!raw) continue;
@@ -379,7 +423,7 @@ export async function streamRoutes(
       }
 
       filter.cancelled = parseCancelled(query.cancelled);
-      
+
       // Parse and validate status filter
       if (query.status) {
         const status = query.status;
@@ -388,16 +432,33 @@ export async function streamRoutes(
         }
         filter.status = status;
       }
-      
+
       filter.cursor = cursor;
+      
+      // Parse amount filters
+      const minAmount = parseAmount(query.minAmount);
+      if (query.minAmount !== undefined && minAmount === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid minAmount (must be non-negative integer)");
+      }
+      filter.minAmount = minAmount ?? undefined;
+      
+      const maxAmount = parseAmount(query.maxAmount);
+      if (query.maxAmount !== undefined && maxAmount === null) {
+        return sendError(reply, request, 400, "VALIDATION_ERROR", "invalid maxAmount (must be non-negative integer)");
+      }
+      filter.maxAmount = maxAmount ?? undefined;
 
       const includeTotal = parseIncludeTotal(query.includeTotal);
-      
+
       const now = nowSeconds();
 
       const [listResult, total] = await Promise.all([
-        listStreams({ ...filter, limit, offset }, now),
-        includeTotal ? countStreams(filter, now) : Promise.resolve(undefined),
+        filter.status
+          ? listStreams({ ...filter, limit, offset }, now)
+          : listStreams({ ...filter, limit, offset }),
+        includeTotal
+          ? filter.status ? countStreams(filter, now) : countStreams(filter)
+          : Promise.resolve(undefined),
       ]);
 
       reply.header("Cache-Control", "public, max-age=30");
@@ -448,29 +509,52 @@ export async function streamRoutes(
         }
       }
 
-      const now = nowSeconds();
-      const entries = await Promise.all(
-        SUMMARY_STATUSES.map(async (status) => {
-          const aggregate = await aggregateStreams(statusWhere(status, now));
-          return [
-            status,
-            {
-              count: aggregate.count,
-              totalAmount: aggregate.totalAmount.toString(),
-              withdrawn: aggregate.withdrawn.toString(),
-            },
-          ] as const;
-        }),
-      );
+      // If another request is already computing the summary, share its result
+      // instead of running a duplicate set of aggregate queries.
+      if (inFlightSummary !== null) {
+        const payload = await inFlightSummary;
+        const ageMs = Date.now() - (cachedSummary?.createdAt ?? 0);
+        const maxAgeSeconds = Math.max(0, Math.floor((summaryCacheTtlMs - ageMs) / 1000));
+        reply.header("Cache-Control", `public, max-age=${maxAgeSeconds}`);
+        return payload;
+      }
 
-      const payload = Object.fromEntries(entries) as SummaryPayload;
-      const createdAt = Date.now();
-      if (summaryCacheTtlMs > 0) cachedSummary = { payload, createdAt };
-      reply.header(
-        "Cache-Control",
-        `public, max-age=${Math.floor(summaryCacheTtlMs / 1000)}`,
-      );
-      return payload;
+      // This request is the first to notice the cache is stale — it owns the
+      // computation. Build the promise, store it so concurrent arrivals can
+      // attach, then await it ourselves.
+      const compute = async (): Promise<SummaryPayload> => {
+        const now = nowSeconds();
+        const entries = await Promise.all(
+          SUMMARY_STATUSES.map(async (status) => {
+            const aggregate = await aggregateStreams(statusWhere(status, now));
+            return [
+              status,
+              {
+                count: aggregate.count,
+                totalAmount: aggregate.totalAmount.toString(),
+                withdrawn: aggregate.withdrawn.toString(),
+              },
+            ] as const;
+          }),
+        );
+        return Object.fromEntries(entries) as SummaryPayload;
+      };
+
+      inFlightSummary = compute();
+      try {
+        const payload = await inFlightSummary;
+        const createdAt = Date.now();
+        if (summaryCacheTtlMs > 0) cachedSummary = { payload, createdAt };
+        reply.header(
+          "Cache-Control",
+          `public, max-age=${Math.floor(summaryCacheTtlMs / 1000)}`,
+        );
+        return payload;
+      } finally {
+        // Always clear the in-flight slot so the next expiry triggers a fresh
+        // computation. On failure this ensures no stale promise is reused.
+        inFlightSummary = null;
+      }
     },
   );
 

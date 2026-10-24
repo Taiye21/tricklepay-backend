@@ -9,11 +9,11 @@ import {
 describe("Server timeouts", () => {
   it("applies default timeouts when not configured", async () => {
     const app = await buildServer({});
-    
-    expect(app.server.connectionTimeout).toBe(DEFAULT_CONNECTION_TIMEOUT_MS);
+
+    expect(app.server.timeout).toBe(DEFAULT_CONNECTION_TIMEOUT_MS);
     expect(app.server.keepAliveTimeout).toBe(DEFAULT_KEEP_ALIVE_TIMEOUT_MS);
     expect(app.server.requestTimeout).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
-    
+
     await app.close();
   });
 
@@ -23,11 +23,11 @@ describe("Server timeouts", () => {
       keepAliveTimeoutMs: 60000,
       requestTimeoutMs: 20000,
     });
-    
-    expect(app.server.connectionTimeout).toBe(15000);
+
+    expect(app.server.timeout).toBe(15000);
     expect(app.server.keepAliveTimeout).toBe(60000);
     expect(app.server.requestTimeout).toBe(20000);
-    
+
     await app.close();
   });
 
